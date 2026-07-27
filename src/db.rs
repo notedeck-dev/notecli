@@ -704,6 +704,38 @@ impl Database {
         Ok(())
     }
 
+    /// DB の一貫したスナップショットを `dest` に書き出す。
+    ///
+    /// 単純なファイルコピーでは WAL に未反映のトランザクションが取り残され、
+    /// 古い、または壊れた複製ができる。`VACUUM INTO` は writer 接続上で
+    /// 単一ファイルの完結したコピーを作るため、-wal / -shm を伴わない。
+    ///
+    /// `strip_tokens` を立てると、複製側の `accounts.token` を空にしてから
+    /// 返す。キーチェーンが永続しない環境では DB に API トークンが平文で
+    /// 残るため、持ち出す成果物からは落とせるようにする。
+    pub fn backup_to(&self, dest: &Path, strip_tokens: bool) -> Result<(), NoteDeckError> {
+        if dest.exists() {
+            // VACUUM INTO は既存ファイルへの書き出しを拒否する
+            std::fs::remove_file(dest).map_err(|e| {
+                NoteDeckError::Database(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("failed to replace existing backup: {e}")),
+                ))
+            })?;
+        }
+        {
+            let conn = self.lock_write()?;
+            conn.execute("VACUUM INTO ?1", params![dest.to_string_lossy()])?;
+        }
+        Self::restrict_permissions(dest);
+
+        if strip_tokens {
+            let copy = Connection::open(dest)?;
+            copy.execute("UPDATE accounts SET token = ''", [])?;
+        }
+        Ok(())
+    }
+
     /// Delete a single note from the cache (e.g. when a deletion event is received).
     pub fn delete_cached_note(&self, note_id: &str) -> Result<(), NoteDeckError> {
         let conn = self.lock_write()?;
@@ -1431,6 +1463,51 @@ mod tests {
             avatar_url: None,
             software: "misskey".to_string(),
         }
+    }
+
+    #[test]
+    fn backup_to_produces_a_readable_copy_with_data() {
+        let (dir, db) = temp_db();
+        db.upsert_account(&sample_account()).unwrap();
+        let dest = dir.path().join("backup.db");
+
+        db.backup_to(&dest, false).unwrap();
+
+        // VACUUM INTO は単一ファイルで完結する (-wal を伴わない)
+        assert!(dest.exists());
+        assert!(!dir.path().join("backup.db-wal").exists());
+
+        let restored = Database::open(&dest).unwrap();
+        let accounts = restored.load_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].token, "test-token");
+    }
+
+    #[test]
+    fn backup_to_can_strip_tokens_from_the_copy() {
+        let (dir, db) = temp_db();
+        db.upsert_account(&sample_account()).unwrap();
+        let dest = dir.path().join("backup.db");
+
+        db.backup_to(&dest, true).unwrap();
+
+        let restored = Database::open(&dest).unwrap();
+        assert_eq!(restored.load_accounts().unwrap()[0].token, "");
+        // 元の DB は触らない
+        assert_eq!(db.load_accounts().unwrap()[0].token, "test-token");
+    }
+
+    #[test]
+    fn backup_to_overwrites_an_existing_file() {
+        let (dir, db) = temp_db();
+        db.upsert_account(&sample_account()).unwrap();
+        let dest = dir.path().join("backup.db");
+        std::fs::write(&dest, b"stale").unwrap();
+
+        db.backup_to(&dest, false).unwrap();
+
+        let restored = Database::open(&dest).unwrap();
+        assert_eq!(restored.load_accounts().unwrap().len(), 1);
     }
 
     #[test]
