@@ -1449,7 +1449,7 @@ pub struct RawEmoji {
 }
 
 /// Emoji info exposed to the frontend via Tauri commands.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct ServerEmoji {
     pub name: String,
