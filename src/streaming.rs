@@ -15,7 +15,8 @@ use crate::error::NoteDeckError;
 use crate::event_bus::{EventBus, SseEvent};
 use crate::models::{
     ChatMessage, ChatReactionUser, NormalizedNote, NormalizedNotification, NoteReactedBody,
-    NoteUnreactedBody, NoteUpdateBody, RawNote, RawNotification, TimelineOptions, TimelineType,
+    NoteUnreactedBody, NoteUpdateBody, RawEmoji, RawNote, RawNotification, ServerEmoji,
+    TimelineOptions, TimelineType,
 };
 
 /// Trait for emitting events to a frontend (e.g., Tauri WebView).
@@ -113,6 +114,8 @@ pub enum StreamEvent {
     ChatMessageUnreacted(Box<StreamChatMessageUnreactedEvent>),
     #[serde(rename = "stream-status")]
     Status(Box<StreamStatusEvent>),
+    #[serde(rename = "stream-emoji-changed")]
+    EmojiChanged(Box<StreamEmojiChangedEvent>),
 }
 
 impl StreamEvent {
@@ -130,6 +133,7 @@ impl StreamEvent {
             Self::ChatMessageReacted(_) => "stream-chat-message-reacted",
             Self::ChatMessageUnreacted(_) => "stream-chat-message-unreacted",
             Self::Status(_) => "stream-status",
+            Self::EmojiChanged(_) => "stream-emoji-changed",
         }
     }
 
@@ -147,6 +151,7 @@ impl StreamEvent {
             Self::ChatMessageReacted(_) => "chat-reacted".into(),
             Self::ChatMessageUnreacted(_) => "chat-unreacted".into(),
             Self::Status(_) => "status".into(),
+            Self::EmojiChanged(_) => "emoji-changed".into(),
         }
     }
 
@@ -164,6 +169,7 @@ impl StreamEvent {
             Self::ChatMessageReacted(e) => serde_json::to_value(e),
             Self::ChatMessageUnreacted(e) => serde_json::to_value(e),
             Self::Status(e) => serde_json::to_value(e),
+            Self::EmojiChanged(e) => serde_json::to_value(e),
         };
         value.unwrap_or_default()
     }
@@ -297,6 +303,30 @@ pub struct StreamNoteCaptureEvent {
 pub struct StreamStatusEvent {
     pub account_id: String,
     pub state: StreamConnectionState,
+}
+
+/// broadcast チャネルの絵文字辞書変更の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "lowercase")]
+pub enum EmojiChangeKind {
+    Added,
+    Updated,
+    Deleted,
+}
+
+/// サーバー全体配信 (broadcast) の絵文字辞書変更 (#889)。
+/// 本家は emojiAdded / emojiUpdated / emojiDeleted を channel ラップなしの
+/// トップレベル type で全接続に配る。
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub struct StreamEmojiChangedEvent {
+    pub account_id: String,
+    /// 絵文字辞書のキーになるサーバー host
+    pub host: String,
+    pub change: EmojiChangeKind,
+    pub emojis: Vec<ServerEmoji>,
 }
 
 // --- Internal commands sent to the WebSocket task ---
@@ -1423,6 +1453,48 @@ async fn handle_ws_message(
         return;
     }
 
+    // Broadcast: 絵文字辞書の変更 (#889)。channel ラップなしのトップレベル
+    // type で全接続に届く。added は { emoji }, updated / deleted は { emojis: [] }
+    let emoji_change = match msg_type {
+        "emojiAdded" => Some(EmojiChangeKind::Added),
+        "emojiUpdated" => Some(EmojiChangeKind::Updated),
+        "emojiDeleted" => Some(EmojiChangeKind::Deleted),
+        _ => None,
+    };
+    if let Some(change) = emoji_change {
+        // msg_type は msg を borrow しているため、get_mut の前に所有へ写す
+        let msg_type = msg_type.to_owned();
+        let Some(mut body) = msg.get_mut("body").map(Value::take) else {
+            return;
+        };
+        let raw = if change == EmojiChangeKind::Added {
+            body.get_mut("emoji")
+                .map(Value::take)
+                .map(|v| Value::Array(vec![v]))
+        } else {
+            body.get_mut("emojis").map(Value::take)
+        };
+        let Some(raw) = raw else { return };
+        let emojis: Vec<ServerEmoji> = match serde_json::from_value::<Vec<RawEmoji>>(raw) {
+            Ok(raws) => raws.into_iter().map(ServerEmoji::from).collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, msg_type, "malformed emoji broadcast; dropped");
+                return;
+            }
+        };
+        if emojis.is_empty() {
+            return;
+        }
+        let payload = StreamEmojiChangedEvent {
+            account_id: account_id.to_string(),
+            host: account_host.to_string(),
+            change,
+            emojis,
+        };
+        emit_both(emitter, event_bus, StreamEvent::EmojiChanged(Box::new(payload)));
+        return;
+    }
+
     // Misskey streaming: { "type": "channel", "body": { "id": "...", "type": "...", "body": ... } }
     if msg_type != "channel" {
         return;
@@ -1908,6 +1980,65 @@ mod tests {
         // connection (only kept alive by ping/pong) would be falsely torn down.
         // 3x gives margin for two consecutive lost pongs.
         assert!(WS_READ_IDLE_TIMEOUT >= WS_PING_INTERVAL * 3);
+    }
+
+    #[tokio::test]
+    async fn emoji_broadcast_messages_become_typed_events() {
+        // #889: 本家の broadcast (emojiAdded / emojiUpdated / emojiDeleted) は
+        // channel ラップなしのトップレベル type で届く。生 JSON は WS 受信
+        // 境界で死に、typed StreamEvent だけが出ていくこと。
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let api = Arc::new(MisskeyClient::new().unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = ChannelEmitter(tx);
+        let event_bus = EventBus::new();
+        let subs: Arc<RwLock<HashMap<String, SubscriptionInfo>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // added は { emoji } 単数形
+        let added = serde_json::json!({
+            "type": "emojiAdded",
+            "body": { "emoji": { "name": "petthex", "url": "https://h.example/petthex.webp" } }
+        })
+        .to_string();
+        // deleted / updated は { emojis: [...] } 複数形
+        let deleted = serde_json::json!({
+            "type": "emojiDeleted",
+            "body": { "emojis": [
+                { "name": "old1", "url": "https://h.example/old1.webp" },
+                { "name": "old2", "url": "https://h.example/old2.webp" }
+            ] }
+        })
+        .to_string();
+        // 未知のトップレベル type は従来どおり捨てられる
+        let unknown = serde_json::json!({ "type": "announcementCreated", "body": {} }).to_string();
+
+        for text in [&added, &deleted, &unknown] {
+            handle_ws_message(
+                &emitter, &event_bus, &db, &api, "acc-1", "h.example", "tok", text, &subs,
+            )
+            .await;
+        }
+
+        let StreamEvent::EmojiChanged(e) = rx.recv().await.unwrap() else {
+            panic!("expected EmojiChanged");
+        };
+        assert_eq!(e.change, EmojiChangeKind::Added);
+        assert_eq!(e.host, "h.example");
+        assert_eq!(e.account_id, "acc-1");
+        assert_eq!(e.emojis.len(), 1);
+        assert_eq!(e.emojis[0].name, "petthex");
+        assert_eq!(e.emojis[0].url, "https://h.example/petthex.webp");
+
+        let StreamEvent::EmojiChanged(e) = rx.recv().await.unwrap() else {
+            panic!("expected EmojiChanged");
+        };
+        assert_eq!(e.change, EmojiChangeKind::Deleted);
+        assert_eq!(e.emojis.len(), 2);
+
+        // announcementCreated は emit されない
+        assert!(rx.try_recv().is_err());
     }
 
     /// stream-status イベントを channel に流すテスト用 emitter。

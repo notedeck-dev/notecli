@@ -743,7 +743,8 @@ async fn get_user_notes(
 /// StreamNoteUpdatedEvent、note-capture-updated → StreamNoteCaptureEvent、
 /// notification → StreamNotificationEvent、main-{eventType} → StreamMainEvent、
 /// chat → StreamChatMessageEvent、chat-deleted / chat-reacted / chat-unreacted →
-/// StreamChatMessage{Deleted,Reacted,Unreacted}Event、status → StreamStatusEvent
+/// StreamChatMessage{Deleted,Reacted,Unreacted}Event、status → StreamStatusEvent、
+/// emoji-changed → StreamEmojiChangedEvent
 #[derive(serde::Serialize, ToSchema)]
 #[serde(untagged)]
 #[allow(dead_code, clippy::large_enum_variant)] // OpenAPI ドキュメント専用の型
@@ -759,6 +760,7 @@ enum SseEventPayload {
     ChatMessageReacted(crate::streaming::StreamChatMessageReactedEvent),
     ChatMessageUnreacted(crate::streaming::StreamChatMessageUnreactedEvent),
     Status(crate::streaming::StreamStatusEvent),
+    EmojiChanged(crate::streaming::StreamEmojiChangedEvent),
 }
 
 #[utoipa::path(
@@ -772,7 +774,7 @@ enum SseEventPayload {
             `SseEventPayload` — the `event:` name selects the variant \
             (`note` / `mention` / `note-updated` / `note-capture-updated` / \
             `notification` / `main-{eventType}` / `chat` / `chat-deleted` / \
-            `chat-reacted` / `chat-unreacted` / `status`). \
+            `chat-reacted` / `chat-unreacted` / `status` / `emoji-changed`). \
             The `type` query param filters by event-name prefix.",
          content_type = "text/event-stream", body = SseEventPayload),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
