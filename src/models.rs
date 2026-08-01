@@ -411,6 +411,15 @@ pub struct NormalizedNotification {
     /// Assigned role (for roleAssigned type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<UserRole>,
+    /// App notification header (for app type; notifications/create の header)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// App notification body (for app type; notifications/create の body)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// App notification icon URL (for app type; notifications/create の icon)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1305,6 +1314,10 @@ pub struct RawNotification {
     pub users: Option<Vec<RawUser>>,
     /// Assigned role (for roleAssigned type)
     pub role: Option<UserRole>,
+    /// App notification header / body / icon (for app type)
+    pub header: Option<String>,
+    pub body: Option<String>,
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1684,6 +1697,9 @@ impl RawNotification {
                 .users
                 .map(|us| us.into_iter().map(Into::into).collect()),
             role: self.role,
+            header: self.header,
+            body: self.body,
+            icon: self.icon,
         }
     }
 }
@@ -2192,6 +2208,46 @@ mod tests {
         assert!(notif.user.is_none());
         assert!(notif.note.is_none());
         assert!(notif.reaction.is_none());
+    }
+
+    // 外部アプリ (notifications/create) が飛ばす app 通知は header / body / icon を持つ
+    #[test]
+    fn raw_notification_normalize_app_type() {
+        let j = json!({
+            "id": "notif3",
+            "createdAt": "2025-01-01T00:00:00.000Z",
+            "type": "app",
+            "header": "Mewk | 実績解除",
+            "body": "Mewkで実績を獲得しました！\n\nスケジューラー",
+            "icon": "https://mewk.app/icon.png"
+        });
+        let raw: RawNotification = serde_json::from_value(j).unwrap();
+        let notif = raw.normalize("acc1", "misskey.io");
+        assert_eq!(notif.notification_type, "app");
+        assert_eq!(notif.header.as_deref(), Some("Mewk | 実績解除"));
+        assert_eq!(
+            notif.body.as_deref(),
+            Some("Mewkで実績を獲得しました！\n\nスケジューラー")
+        );
+        assert_eq!(notif.icon.as_deref(), Some("https://mewk.app/icon.png"));
+    }
+
+    // header / icon は nullable。body だけの app 通知でも落ちない
+    #[test]
+    fn raw_notification_normalize_app_type_without_header() {
+        let j = json!({
+            "id": "notif4",
+            "createdAt": "2025-01-01T00:00:00.000Z",
+            "type": "app",
+            "header": null,
+            "body": "本文のみ",
+            "icon": null
+        });
+        let raw: RawNotification = serde_json::from_value(j).unwrap();
+        let notif = raw.normalize("acc1", "misskey.io");
+        assert!(notif.header.is_none());
+        assert_eq!(notif.body.as_deref(), Some("本文のみ"));
+        assert!(notif.icon.is_none());
     }
 
     #[test]
