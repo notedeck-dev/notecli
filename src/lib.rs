@@ -13,7 +13,7 @@ pub mod server_info;
 pub mod streaming;
 
 use db::Database;
-use error::NoteDeckError;
+use error::{AuthErrorKind, NoteDeckError};
 use zeroize::Zeroize;
 
 /// Retrieve host and API token for an account.
@@ -48,8 +48,8 @@ pub fn get_credentials(db: &Database, account_id: &str) -> Result<(String, Strin
         return Ok((host, token));
     }
 
-    Err(NoteDeckError::Auth(format!(
-        "No token found for account {account_id}"
+    Err(NoteDeckError::Auth(AuthErrorKind::NoToken(
+        account_id.to_string(),
     )))
 }
 
@@ -91,7 +91,7 @@ mod tests {
         db.upsert_account(&account).unwrap();
         // keychain will fail in test env, DB token is empty → Auth error
         let err = get_credentials(&db, "acc1").unwrap_err();
-        assert_eq!(err.code(), "AUTH");
+        assert_eq!(err.code(), "AUTH_NO_TOKEN");
     }
 
     #[test]

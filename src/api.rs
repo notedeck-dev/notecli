@@ -6,7 +6,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::error::NoteDeckError;
+use crate::error::{AuthErrorKind, NoteDeckError};
 use crate::models::{
     Antenna, AuthResult, Channel, ChatMessage, ChatUser, Clip, CreateNoteParams,
     NormalizedDriveFile, NormalizedNote, NormalizedNoteReaction, NormalizedNotification,
@@ -90,6 +90,7 @@ impl MisskeyClient {
                 return Err(NoteDeckError::Api {
                     endpoint: endpoint.to_string(),
                     status: 0,
+                    api_code: None,
                     message: "Response too large".to_string(),
                 });
             }
@@ -104,6 +105,7 @@ impl MisskeyClient {
                 return Err(NoteDeckError::Api {
                     endpoint: endpoint.to_string(),
                     status: 0,
+                    api_code: None,
                     message: "Response too large".to_string(),
                 });
             }
@@ -111,6 +113,7 @@ impl MisskeyClient {
         String::from_utf8(buf).map_err(|_| NoteDeckError::Api {
             endpoint: endpoint.to_string(),
             status: 0,
+            api_code: None,
             message: "Invalid UTF-8 in response".to_string(),
         })
     }
@@ -160,6 +163,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: endpoint.to_string(),
                 status,
+                api_code,
                 message,
             });
         }
@@ -667,6 +671,7 @@ impl MisskeyClient {
             .map_err(|e| NoteDeckError::Api {
                 endpoint: "drive/files/create".to_string(),
                 status: 0,
+                api_code: None,
                 message: e.to_string(),
             })?;
 
@@ -689,6 +694,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "drive/files/create".to_string(),
                 status,
+                api_code: None,
                 message,
             });
         }
@@ -928,26 +934,23 @@ impl MisskeyClient {
             .await?;
 
         if !res.status().is_success() {
-            return Err(NoteDeckError::Auth(format!(
-                "MiAuth check failed: {}",
-                res.status().as_u16()
+            return Err(NoteDeckError::Auth(AuthErrorKind::MiAuthFailed(
+                res.status().as_u16(),
             )));
         }
 
         let text = Self::read_body_limited(res, "miauth/check").await?;
         let data: RawMiAuthResponse = serde_json::from_str(&text)?;
         if !data.ok {
-            return Err(NoteDeckError::Auth(
-                "MiAuth authentication was not completed".to_string(),
-            ));
+            return Err(NoteDeckError::Auth(AuthErrorKind::MiAuthPending));
         }
 
         let token = data
             .token
-            .ok_or_else(|| NoteDeckError::Auth("MiAuth response missing token".to_string()))?;
+            .ok_or(NoteDeckError::Auth(AuthErrorKind::MiAuthMalformed("token")))?;
         let user = data
             .user
-            .ok_or_else(|| NoteDeckError::Auth("MiAuth response missing user".to_string()))?;
+            .ok_or(NoteDeckError::Auth(AuthErrorKind::MiAuthMalformed("user")))?;
 
         Ok(AuthResult {
             token,
@@ -1338,6 +1341,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "endpoint".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch endpoint info".to_string(),
             });
         }
@@ -1383,6 +1387,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "endpoints".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch endpoints".to_string(),
             });
         }
@@ -2155,6 +2160,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: ".well-known/nodeinfo".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch well-known nodeinfo".to_string(),
             });
         }
@@ -2176,6 +2182,7 @@ impl MisskeyClient {
             .ok_or_else(|| NoteDeckError::Api {
                 endpoint: ".well-known/nodeinfo".to_string(),
                 status: 0,
+                api_code: None,
                 message: format!("No nodeinfo URL found for {host}"),
             })?;
 
@@ -2185,6 +2192,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: ".well-known/nodeinfo".to_string(),
                 status: 0,
+                api_code: None,
                 message: format!("Nodeinfo URL host/scheme mismatch for {host}"),
             });
         }
@@ -2199,6 +2207,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "nodeinfo".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch nodeinfo".to_string(),
             });
         }
@@ -2580,6 +2589,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "meta".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch server meta".to_string(),
             });
         }
