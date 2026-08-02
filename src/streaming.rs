@@ -2092,4 +2092,289 @@ mod tests {
         // disconnect が backoff 中の Shutdown を届けて task を終了できる
         manager.disconnect("acc-1").await;
     }
+
+    // --- 接続ライフサイクルの状態遷移 (#877) ---
+    //
+    // connect() は初回接続に失敗してもハンドルを残す (上のテスト) ので、
+    // 到達不能な host を使えば実サーバーなしで購読・中断・再開・モード切替の
+    // 状態遷移を通せる。WS のフレームそのものではなく、StreamingManager が
+    // 持つ表 (connections / subscriptions / captured_notes) の遷移を見る。
+
+    /// 到達不能な host に接続したマネージャ。ハンドルは残るので購読操作は通る。
+    async fn manager_with_dead_connection(
+        accounts: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        StreamingManager,
+        mpsc::UnboundedReceiver<StreamEvent>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let manager =
+            StreamingManager::new(Arc::new(ChannelEmitter(tx)), Arc::new(EventBus::new()), db);
+        for account_id in accounts {
+            // 127.0.0.1:1 は即 connection refused
+            manager
+                .connect(account_id, "127.0.0.1:1", "token")
+                .await
+                .unwrap();
+        }
+        (dir, manager, rx)
+    }
+
+    fn drain_status(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<StreamConnectionState> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::Status(s) = event {
+                out.push(s.state);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn connect_is_idempotent_and_reports_the_live_state() {
+        // 2 回目の connect は接続を張り直さず、いま持っている実状態を emit する。
+        // フロントは復帰時にリスナーを張り直してから connect を呼ぶので、
+        // ここで status が出ないと背景化中の遷移を取り逃したままになる。
+        let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1"]).await;
+        drain_status(&mut rx);
+
+        manager.connect("acc-1", "127.0.0.1:1", "token").await.unwrap();
+
+        // 接続タスクは 1 本のまま (張り直していない)
+        assert_eq!(manager.connections.lock().await.len(), 1);
+        // 未接続なので Reconnecting が返る (楽観的に Connected と言わない)
+        assert!(
+            drain_status(&mut rx).contains(&StreamConnectionState::Reconnecting),
+            "冪等 return でも現在状態を emit すること"
+        );
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_without_connection_reports_no_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let manager =
+            StreamingManager::new(Arc::new(ChannelEmitter(tx)), Arc::new(EventBus::new()), db);
+
+        let err = manager
+            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .await
+            .expect_err("接続していないアカウントの購読は通らない");
+        assert_eq!(err.code(), "NO_CONNECTION");
+        // 失敗した購読が表に残らない
+        assert!(manager.subscriptions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_only_that_accounts_state() {
+        // cross-account (#777): 片方を切っても、もう片方の購読と capture は残る。
+        let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1", "acc-2"]).await;
+        let sub1 = manager
+            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .await
+            .unwrap();
+        let sub2 = manager
+            .subscribe_timeline("acc-2", TimelineType::new("local"), None)
+            .await
+            .unwrap();
+        manager.sub_note("acc-1", "note-1").await.unwrap();
+        manager.sub_note("acc-2", "note-2").await.unwrap();
+        drain_status(&mut rx);
+
+        manager.disconnect("acc-1").await;
+
+        let subs = manager.subscriptions.read().await;
+        assert!(!subs.contains_key(&sub1), "切断した側の購読は消える");
+        assert!(subs.contains_key(&sub2), "他アカウントの購読は残る");
+        drop(subs);
+        let captured = manager.captured_notes.read().await;
+        assert!(!captured.contains_key("acc-1"));
+        assert!(captured.contains_key("acc-2"));
+        drop(captured);
+        assert!(drain_status(&mut rx).contains(&StreamConnectionState::Disconnected));
+
+        manager.disconnect("acc-2").await;
+    }
+
+    #[tokio::test]
+    async fn suspend_then_resume_round_trips_the_active_flag() {
+        // ビューポート予算で使う中断/再開。metadata を捨てずに active だけを倒す
+        // (捨てると再接続リプレイと再開で channel / params を復元できない)。
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
+        let sub = manager
+            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .await
+            .unwrap();
+
+        manager.suspend_subscription("acc-1", &sub).await.unwrap();
+        {
+            let subs = manager.subscriptions.read().await;
+            let info = subs.get(&sub).expect("中断しても metadata は残る");
+            assert!(!info.active);
+            assert_eq!(info.channel, "homeTimeline");
+        }
+        // 二重中断は no-op で成功する (UI 側で状態を持たなくてよい)
+        manager.suspend_subscription("acc-1", &sub).await.unwrap();
+
+        manager.resume_subscription("acc-1", &sub).await.unwrap();
+        assert!(manager.subscriptions.read().await[&sub].active);
+        // 二重再開も no-op
+        manager.resume_subscription("acc-1", &sub).await.unwrap();
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn suspend_and_resume_reject_another_accounts_subscription() {
+        // 購読 ID を知っていても、持ち主でなければ触れない。
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1", "acc-2"]).await;
+        let sub = manager
+            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .await
+            .unwrap();
+
+        let err = manager
+            .suspend_subscription("acc-2", &sub)
+            .await
+            .expect_err("他アカウントの購読は中断できない");
+        assert_eq!(err.code(), "INVALID_INPUT");
+        assert!(
+            manager.subscriptions.read().await[&sub].active,
+            "拒否したのに active を倒してはいけない"
+        );
+
+        manager.suspend_subscription("acc-1", &sub).await.unwrap();
+        let err = manager
+            .resume_subscription("acc-2", &sub)
+            .await
+            .expect_err("他アカウントの購読は再開できない");
+        assert_eq!(err.code(), "INVALID_INPUT");
+        assert!(!manager.subscriptions.read().await[&sub].active);
+
+        manager.disconnect("acc-1").await;
+        manager.disconnect("acc-2").await;
+    }
+
+    #[tokio::test]
+    async fn unknown_subscription_is_rejected_not_silently_ignored() {
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
+        assert_eq!(
+            manager
+                .suspend_subscription("acc-1", "no-such-sub")
+                .await
+                .expect_err("存在しない購読")
+                .code(),
+            "INVALID_INPUT"
+        );
+        assert_eq!(
+            manager
+                .resume_subscription("acc-1", "no-such-sub")
+                .await
+                .expect_err("存在しない購読")
+                .code(),
+            "INVALID_INPUT"
+        );
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn note_capture_survives_until_explicitly_dropped() {
+        // captured_notes は再接続時のリプレイ元。sub_note が表に載せないと
+        // 最初の再接続以降 noteUpdated が黙って止まる。
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
+
+        manager.sub_note("acc-1", "note-1").await.unwrap();
+        manager.sub_note("acc-1", "note-2").await.unwrap();
+        assert_eq!(manager.captured_notes.read().await["acc-1"].len(), 2);
+
+        manager.unsub_note("acc-1", "note-1").await.unwrap();
+        assert_eq!(manager.captured_notes.read().await["acc-1"].len(), 1);
+
+        // 最後の 1 件を外すとアカウントのエントリごと消える (空 set を残さない)
+        manager.unsub_note("acc-1", "note-2").await.unwrap();
+        assert!(!manager.captured_notes.read().await.contains_key("acc-1"));
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn set_mode_rejects_unknown_mode() {
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
+        let err = manager
+            .set_mode("acc-1", "127.0.0.1:1", "token", "carrier-pigeon", None)
+            .await
+            .expect_err("未知のモード");
+        assert_eq!(err.code(), "INVALID_INPUT");
+        // 既存の接続を壊していない
+        assert_eq!(manager.connections.lock().await.len(), 1);
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn switching_to_polling_keeps_subscriptions_and_swaps_the_transport() {
+        // モード切替は輸送路だけを差し替える。購読を捨てると切替のたびに
+        // カラムが空になる。
+        let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1"]).await;
+        let sub = manager
+            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .await
+            .unwrap();
+        drain_status(&mut rx);
+
+        manager
+            .set_mode("acc-1", "127.0.0.1:1", "token", "polling", Some(60_000))
+            .await
+            .unwrap();
+
+        assert!(
+            manager.connections.lock().await.is_empty(),
+            "polling へ移ったら WS 接続は畳む"
+        );
+        assert!(manager.poll_connections.lock().await.contains_key("acc-1"));
+        assert!(
+            manager.subscriptions.read().await.contains_key(&sub),
+            "購読はモードをまたいで残る"
+        );
+        assert!(drain_status(&mut rx).contains(&StreamConnectionState::Connected));
+
+        // polling 中でも購読を足せる (WS コマンドではなく表に載るだけ)
+        let sub2 = manager
+            .subscribe_timeline("acc-1", TimelineType::new("local"), None)
+            .await
+            .unwrap();
+        assert!(manager.subscriptions.read().await.contains_key(&sub2));
+
+        // realtime へ戻すと polling を止めて WS を張り直す
+        manager
+            .set_mode("acc-1", "127.0.0.1:1", "token", "realtime", None)
+            .await
+            .unwrap();
+        assert!(manager.poll_connections.lock().await.is_empty());
+        assert_eq!(manager.connections.lock().await.len(), 1);
+        assert!(manager.subscriptions.read().await.contains_key(&sub));
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_drops_the_subscription_in_both_modes() {
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
+        let sub = manager
+            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .await
+            .unwrap();
+
+        manager.unsubscribe("acc-1", &sub).await.unwrap();
+        assert!(manager.subscriptions.read().await.is_empty());
+
+        // 接続が無くなっても unsubscribe は表を掃除して成功する
+        manager.disconnect("acc-1").await;
+        manager.unsubscribe("acc-1", &sub).await.unwrap();
+    }
 }
