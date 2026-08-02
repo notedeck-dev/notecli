@@ -39,6 +39,23 @@ fn apply_pagination(params: &mut Value, since_id: Option<&str>, until_id: Option
     }
 }
 
+/// Misskey ID (aid / aidx) の時刻部の基準時刻 (2000-01-01T00:00:00Z)。
+const TIME2000_MS: i64 = 946_684_800_000;
+
+/// epoch ミリ秒を Misskey ID の時刻部 (base36 8 桁) に変換する。
+///
+/// サーバーは sinceId/untilId を `idService.parse()` で createdAt に戻して
+/// 比較するため、時刻部だけの ID でも日付フィルタとして機能する。
+fn misskey_id_at(ms: i64) -> String {
+    let mut n = (ms - TIME2000_MS).max(0) as u64;
+    let mut s = String::new();
+    while n > 0 {
+        s.insert(0, char::from_digit((n % 36) as u32, 36).unwrap());
+        n /= 36;
+    }
+    format!("{s:0>8}")
+}
+
 pub struct MisskeyClient {
     client: Client,
     /// Override base URL for testing (e.g. "http://127.0.0.1:PORT").
@@ -868,6 +885,44 @@ impl MisskeyClient {
             params["userId"] = json!(uid);
         }
         let data = self.request(host, token, "notes/search", params).await?;
+        let raw: Vec<RawNote> = serde_json::from_value(data)?;
+        Ok(raw
+            .into_iter()
+            .map(|n| n.normalize(account_id, host))
+            .collect())
+    }
+
+    /// はなみすきー (hanamisskey/misskey) 独自のノート検索。
+    ///
+    /// 本家 `notes/search` はロールポリシー `canSearchNotes` で無効化されており、
+    /// 代わりに `notes/hanamisearch-v1` が開放されている。このエンドポイントは
+    /// sinceDate/untilDate を受け付けないため、日付は ID の時刻部に変換して渡す。
+    /// ページング用の sinceId/untilId が明示されていればそちらを優先する
+    /// (untilId で遡る 2 ページ目以降は日付の上限より必ず古いため)。
+    pub async fn search_notes_hanami(
+        &self,
+        host: &str,
+        token: &str,
+        account_id: &str,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
+        let mut params = json!({ "query": query, "limit": options.limit() });
+        let since_id = options
+            .since_id
+            .clone()
+            .or_else(|| options.since_date.map(misskey_id_at));
+        let until_id = options
+            .until_id
+            .clone()
+            .or_else(|| options.until_date.map(misskey_id_at));
+        apply_pagination(&mut params, since_id.as_deref(), until_id.as_deref());
+        if let Some(ref uid) = options.user_id {
+            params["userId"] = json!(uid);
+        }
+        let data = self
+            .request(host, token, "notes/hanamisearch-v1", params)
+            .await?;
         let raw: Vec<RawNote> = serde_json::from_value(data)?;
         Ok(raw
             .into_iter()
@@ -2933,6 +2988,61 @@ mod tests {
             .unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].text.as_deref(), Some("Rust is great"));
+    }
+
+    #[test]
+    fn misskey_id_at_encodes_time_part() {
+        // misskey.flowers の実 ID apfldnaym0v100e3 (createdAt 2026-08-02T16:41:40.666Z)
+        assert_eq!(misskey_id_at(1_785_688_900_666), "apfldnay");
+        assert_eq!(misskey_id_at(TIME2000_MS), "00000000");
+        // 2000 年より前は下限に丸める
+        assert_eq!(misskey_id_at(0), "00000000");
+    }
+
+    #[tokio::test]
+    async fn search_notes_hanami_uses_hanamisearch_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/hanamisearch-v1"))
+            .and(body_partial_json(
+                json!({ "query": "rust", "sinceId": "apfldnay", "untilId": "apfldnay" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([raw_note_json("n1", "rust note")])),
+            )
+            .mount(&server)
+            .await;
+
+        let mut options = SearchOptions::default();
+        options.since_date = Some(1_785_688_900_666);
+        options.until_date = Some(1_785_688_900_666);
+        let client = MisskeyClient::with_base_url(&server.uri());
+        let notes = client
+            .search_notes_hanami("h", "token", "acc1", "rust", options)
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_notes_hanami_prefers_explicit_pagination_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/hanamisearch-v1"))
+            .and(body_partial_json(json!({ "untilId": "n42" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let mut options = SearchOptions::default();
+        options.until_id = Some("n42".to_string());
+        options.until_date = Some(1_785_688_900_666);
+        let client = MisskeyClient::with_base_url(&server.uri());
+        client
+            .search_notes_hanami("h", "token", "acc1", "rust", options)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
