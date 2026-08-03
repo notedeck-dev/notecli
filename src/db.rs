@@ -5,6 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::error::NoteDeckError;
 use crate::models::{
     Account, ChatMessage, ChatMessageReaction, ChatReactionUser, NormalizedNote, ServerDetection,
+    TimelineKey,
 };
 
 mod embedded {
@@ -34,11 +35,14 @@ const PRAGMAS_WRITER: &str = "\
     PRAGMA journal_mode=WAL;\
     PRAGMA foreign_keys=ON;\
     PRAGMA synchronous=NORMAL;\
+    PRAGMA busy_timeout=5000;\
+    PRAGMA journal_size_limit=67108864;\
     PRAGMA mmap_size=268435456;\
     PRAGMA cache_size=-16000;\
     PRAGMA temp_store=MEMORY;";
 
 const PRAGMAS_READER: &str = "\
+    PRAGMA busy_timeout=5000;\
     PRAGMA mmap_size=268435456;\
     PRAGMA cache_size=-8000;\
     PRAGMA temp_store=MEMORY;";
@@ -47,6 +51,11 @@ const PRAGMAS_READER: &str = "\
 /// 大きすぎると起動が遅くなり、小さすぎると free page が溜まり続ける。
 const INCREMENTAL_VACUUM_PAGES_PER_BOOT: i64 = 1000;
 
+/// per-timeline トリムの 1 チャンク tx あたりの victim 上限。
+/// 初回有効化 (1M 規模で百万行級の削除) が単一 tx だと writer lock を分オーダーで
+/// 占有し WS ingest / 全コマンドが停止するため分割する。
+const TRIM_CHUNK_ROWS: i64 = 50_000;
+
 /// `notes_cache` の eviction policy。 デフォルトは「ほぼ永続保存」 — notedeck の
 /// 「過去ノートを一瞬でローカル検索」という UX を尊重し、 暴走防止の hard cap
 /// だけを残す。 アプリ側からユーザー設定で上書きできる。
@@ -54,10 +63,13 @@ const INCREMENTAL_VACUUM_PAGES_PER_BOOT: i64 = 1000;
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct EvictionConfig {
-    /// 各アカウントごとの note 上限。`None` なら無制限。
+    /// 各アカウントごとの note (entity) 上限。`None` なら無制限。
     pub per_account_limit: Option<i64>,
     /// `cached_at` の TTL (日)。`None` なら無期限保持。
     pub ttl_days: Option<i64>,
+    /// バケット (account_id × timeline_key) ごとの所属行上限。`None` なら無制限。
+    /// トリムは membership とその対象限定の orphan entity のみを消す。
+    pub per_timeline_limit: Option<i64>,
 }
 
 impl Default for EvictionConfig {
@@ -66,6 +78,7 @@ impl Default for EvictionConfig {
         Self {
             per_account_limit: Some(1_000_000),
             ttl_days: None,
+            per_timeline_limit: None,
         }
     }
 }
@@ -174,8 +187,23 @@ impl Database {
         // 既存 DB の場合はここで一度だけ VACUUM が走る。
         Self::ensure_incremental_vacuum(&writer)?;
 
-        // Run numbered migrations (V1, V2, ...)
+        // V6 (実体/所属分離) は既存 DB の全行リライトを伴い 1M 行で 1 分前後かかる。
+        // 既定 EnvFilter=warn では info が出ず無言ハングに見えるため warn で告知する。
+        let long_migration_pending = Self::schema_version(&writer).is_some_and(|v| v < 6);
+        if long_migration_pending {
+            tracing::warn!(
+                "applying notes-cache schema migration (V6); this may take a minute \
+                 and temporarily needs free disk up to ~2x the database size"
+            );
+        }
+        let migration_started = std::time::Instant::now();
+
+        // Run numbered migrations (V1, V2, ...)。
+        // set_grouped(true) は必須: 既定 (grouped=false) では migration 本体と
+        // schema_history 記録が別コミットになり、間で kill されると非冪等 SQL
+        // (V2 の ADD COLUMN / V6 の DROP COLUMN) の再適用が失敗して DB が開けなくなる。
         embedded::migrations::runner()
+            .set_grouped(true)
             .run(&mut writer)
             .map_err(|e| {
                 NoteDeckError::Database(rusqlite::Error::SqliteFailure(
@@ -183,6 +211,15 @@ impl Database {
                     Some(format!("Migration failed: {e}")),
                 ))
             })?;
+        if long_migration_pending {
+            tracing::warn!(
+                elapsed_ms = migration_started.elapsed().as_millis() as u64,
+                "notes-cache schema migration complete"
+            );
+        }
+
+        // checkpoint#1: migration が膨らませた WAL を回収する (best-effort)。
+        Self::wal_checkpoint_truncate(&writer);
 
         // One-time FTS rebuild for existing databases upgraded before FTS5 was added
         Self::rebuild_fts_if_needed(&writer)?;
@@ -204,7 +241,51 @@ impl Database {
         db.cleanup_chat_with_eviction(&chat_eviction)?;
         // cleanup で生まれた free page を少し返却する (起動コスト一定)。
         db.incremental_vacuum_step()?;
+        {
+            let conn = db.lock_write()?;
+            // 空テーブルへの ANALYZE は stat1 を作らないため、新規 DB が成長した後の
+            // stat1 生成 (idx_note_timelines_note を CASCADE に選ばせる必須要件) を
+            // ここが担う。ANALYZE 済みなら実質 no-op。
+            conn.execute_batch("PRAGMA optimize;")?;
+            // checkpoint#2: cleanup / optimize / vacuum step の write を回収 (best-effort)。
+            Self::wal_checkpoint_truncate(&conn);
+        }
         Ok(db)
+    }
+
+    /// refinery_schema_history の最新 version。テーブルが無い (新規 DB) なら None。
+    fn schema_version(conn: &Connection) -> Option<i64> {
+        conn.query_row(
+            "SELECT MAX(version) FROM refinery_schema_history",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` を best-effort で実行する。
+    /// 他プロセスの active reader/writer がいると busy=1 の結果行を返して
+    /// エラーなく劣化する (frame copy は完了、truncate のみ持ち越し)。
+    /// 恒久残留の防止は毎起動の再試行が実体。
+    fn wal_checkpoint_truncate(conn: &Connection) {
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok((busy, log, checkpointed)) if busy != 0 => {
+                tracing::debug!(
+                    log,
+                    checkpointed,
+                    "wal_checkpoint(TRUNCATE) busy; truncate deferred"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "wal_checkpoint(TRUNCATE) failed"),
+        }
     }
 
     /// DB 本体と WAL/SHM を owner-only (0600) に締める。失敗しても DB は開ける
@@ -384,12 +465,20 @@ impl Database {
 
     pub fn delete_account(&self, id: &str) -> Result<(), NoteDeckError> {
         let conn = self.lock_write()?;
-        conn.execute("DELETE FROM notes_cache WHERE account_id = ?1", params![id])?;
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        // membership を先に一括 DELETE してから entity を消す (行単位 CASCADE +
+        // FTS トリガの遅い経路を回避 — clear_account_cache と同じ理由)。
+        tx.execute(
+            "DELETE FROM note_timelines WHERE account_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM notes_cache WHERE account_id = ?1", params![id])?;
+        tx.execute(
             "DELETE FROM chat_messages_cache WHERE account_id = ?1",
             params![id],
         )?;
-        conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -398,17 +487,26 @@ impl Database {
     /// Delete all cached notes for a specific account.
     pub fn clear_account_cache(&self, account_id: &str) -> Result<u64, NoteDeckError> {
         let conn = self.lock_write()?;
-        let deleted = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM note_timelines WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM notes_cache WHERE account_id = ?1",
             params![account_id],
         )?;
+        tx.commit()?;
         Ok(deleted as u64)
     }
 
     /// Delete all cached notes for every account.
     pub fn clear_all_notes_cache(&self) -> Result<u64, NoteDeckError> {
         let conn = self.lock_write()?;
-        let deleted = conn.execute("DELETE FROM notes_cache", [])?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM note_timelines", [])?;
+        let deleted = tx.execute("DELETE FROM notes_cache", [])?;
+        tx.commit()?;
         Ok(deleted as u64)
     }
 
@@ -476,11 +574,21 @@ impl Database {
 
     // --- Notes cache ---
 
-    pub fn cache_notes(
+    /// 唯一の書込経路。entity upsert + membership upsert を単一 tx で行う。
+    ///
+    /// - entity: `ON CONFLICT DO UPDATE` (text / note_json / cached_at / uri)。
+    ///   新旧判定は持たない last-writer-wins (WS/polling の fire-and-forget により
+    ///   DB 到達順は無保証 — 現行同等)。
+    /// - membership: `ON CONFLICT DO NOTHING` (added_at は初回値維持)。
+    /// - sort_key は常に `note.created_at` (サーバー由来文字列をそのまま) を書く。
+    /// - account_id は各 note の `NormalizedNote.account_id` から取る (混在配列も
+    ///   per-note に正しく処理)。
+    pub fn ingest_notes(
         &self,
         notes: &[NormalizedNote],
-        timeline_type: &str,
+        key: &TimelineKey,
     ) -> Result<(), NoteDeckError> {
+        let canonical = key.as_canonical();
         let conn = self.lock_write()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -488,19 +596,23 @@ impl Database {
             .as_secs() as i64;
         let tx = conn.unchecked_transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO notes_cache (note_id, account_id, server_host, created_at, text, note_json, cached_at, timeline_type, uri)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            let mut entity_stmt = tx.prepare_cached(
+                "INSERT INTO notes_cache (note_id, account_id, server_host, created_at, text, note_json, cached_at, uri)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(note_id, account_id) DO UPDATE SET
                      text = excluded.text,
                      note_json = excluded.note_json,
                      cached_at = excluded.cached_at,
-                     timeline_type = excluded.timeline_type,
                      uri = excluded.uri",
+            )?;
+            let mut membership_stmt = tx.prepare_cached(
+                "INSERT INTO note_timelines (account_id, timeline_key, note_id, sort_key, added_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(account_id, timeline_key, note_id) DO NOTHING",
             )?;
             for note in notes {
                 let json = serde_json::to_string(note).unwrap_or_default();
-                stmt.execute(params![
+                entity_stmt.execute(params![
                     note.id,
                     note.account_id,
                     note.server_host,
@@ -508,8 +620,14 @@ impl Database {
                     note.text,
                     json,
                     now,
-                    timeline_type,
                     note.uri,
+                ])?;
+                membership_stmt.execute(params![
+                    note.account_id,
+                    canonical,
+                    note.id,
+                    note.created_at,
+                    now,
                 ])?;
             }
         }
@@ -517,12 +635,88 @@ impl Database {
         Ok(())
     }
 
-    pub fn cache_note(
+    /// バケットから 1 ノートの所属を外す。当該バケットにのみ所属する entity は
+    /// 同一 tx で掃除する (CASCADE が membership を道連れにする)。
+    ///
+    /// 戻り値は「対象 note の membership が実在し削除されたか」の件数 (0 or 1)。
+    /// entity 先行 CASCADE の場合も 1 と数える。
+    pub fn remove_membership(
         &self,
-        note: &NormalizedNote,
-        timeline_type: &str,
-    ) -> Result<(), NoteDeckError> {
-        self.cache_notes(std::slice::from_ref(note), timeline_type)
+        account_id: &str,
+        key: &TimelineKey,
+        note_id: &str,
+    ) -> Result<u64, NoteDeckError> {
+        let canonical = key.as_canonical();
+        let conn = self.lock_write()?;
+        let tx = conn.unchecked_transaction()?;
+        // 逆順 2 文: ①当該バケットにのみ所属する entity を先に DELETE (CASCADE が
+        // membership を道連れ)。述語は EXISTS(当該バケット) ∧ NOT EXISTS(他バケット)
+        // — EXISTS を欠くと membership ゼロの orphan entity を巻き添え削除して
+        // 件数意味論が破れる。
+        let entity_deleted = tx.execute(
+            "DELETE FROM notes_cache
+             WHERE note_id = ?3 AND account_id = ?1
+               AND EXISTS (SELECT 1 FROM note_timelines m
+                           WHERE m.account_id = ?1 AND m.timeline_key = ?2 AND m.note_id = ?3)
+               AND NOT EXISTS (SELECT 1 FROM note_timelines m
+                               WHERE m.note_id = ?3 AND m.account_id = ?1
+                                 AND m.timeline_key <> ?2)",
+            params![account_id, canonical, note_id],
+        )?;
+        // ②残 membership DELETE (①が発火した場合は CASCADE 済みで 0 行)
+        let membership_deleted = tx.execute(
+            "DELETE FROM note_timelines
+             WHERE account_id = ?1 AND timeline_key = ?2 AND note_id = ?3",
+            params![account_id, canonical, note_id],
+        )?;
+        tx.commit()?;
+        Ok((entity_deleted + membership_deleted) as u64)
+    }
+
+    /// バケットを丸ごと破棄する (次回フェッチで再構築される)。
+    /// 当該バケットにのみ所属する entity は同一 tx で掃除する。
+    ///
+    /// 戻り値は削除した membership 行数 (対象限定掃除で消えた entity は数えない —
+    /// ①の entity 1 件は CASCADE でちょうど 1 membership を道連れにするため
+    /// ①+② が membership 総数になる)。
+    pub fn clear_timeline(
+        &self,
+        account_id: &str,
+        key: &TimelineKey,
+    ) -> Result<u64, NoteDeckError> {
+        let canonical = key.as_canonical();
+        let conn = self.lock_write()?;
+        let tx = conn.unchecked_transaction()?;
+        let entity_deleted = tx.execute(
+            "DELETE FROM notes_cache
+             WHERE (note_id, account_id) IN (
+                 SELECT m.note_id, m.account_id FROM note_timelines m
+                 WHERE m.account_id = ?1 AND m.timeline_key = ?2
+                   AND NOT EXISTS (SELECT 1 FROM note_timelines o
+                                   WHERE o.note_id = m.note_id AND o.account_id = m.account_id
+                                     AND o.timeline_key <> ?2))",
+            params![account_id, canonical],
+        )?;
+        let membership_deleted = tx.execute(
+            "DELETE FROM note_timelines WHERE account_id = ?1 AND timeline_key = ?2",
+            params![account_id, canonical],
+        )?;
+        tx.commit()?;
+        Ok((entity_deleted + membership_deleted) as u64)
+    }
+
+    /// どのバケットにも所属しない entity を掃除する (修復用の手動 API。自動実行なし)。
+    /// 戻り値は削除した entity 行数。
+    pub fn sweep_orphan_notes(&self) -> Result<u64, NoteDeckError> {
+        let conn = self.lock_write()?;
+        let deleted = conn.execute(
+            "DELETE FROM notes_cache
+             WHERE NOT EXISTS (SELECT 1 FROM note_timelines m
+                               WHERE m.note_id = notes_cache.note_id
+                                 AND m.account_id = notes_cache.account_id)",
+            [],
+        )?;
+        Ok(deleted as u64)
     }
 
     /// Find cached notes by ActivityPub URI across all accounts.
@@ -787,20 +981,23 @@ impl Database {
         Ok(rows)
     }
 
+    /// バケットの最新 `limit` 件を返す。membership を index seek → entity を PK lookup。
+    /// limit は membership 行数に適用し、note_json parse 失敗行は skip (返却 < limit 許容)。
     pub fn get_cached_timeline(
         &self,
         account_id: &str,
-        timeline_type: &str,
+        key: &TimelineKey,
         limit: i64,
     ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
         let conn = self.lock_read()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT note_json FROM notes_cache
-             WHERE account_id = ?1 AND timeline_type = ?2
-             ORDER BY created_at DESC
+            "SELECT e.note_json FROM note_timelines m
+             JOIN notes_cache e ON e.note_id = m.note_id AND e.account_id = m.account_id
+             WHERE m.account_id = ?1 AND m.timeline_key = ?2
+             ORDER BY m.sort_key DESC, m.note_id DESC
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![account_id, timeline_type, limit], |row| {
+        let rows = stmt.query_map(params![account_id, key.as_canonical(), limit], |row| {
             let json_str: String = row.get(0)?;
             Ok(json_str)
         })?;
@@ -825,36 +1022,60 @@ impl Database {
     /// して該当する DELETE をスキップする。 アプリ実行中に設定を変えた直後にも
     /// 呼ぶ想定 (UI から「すぐ反映」 ボタン等)。
     ///
-    /// 削除順:
-    /// 1. **TTL**: `cached_at < now - ttl_days` の行を削除 (`ttl_days = None` ならスキップ)。
-    /// 2. **Per-account hard cap**: アカウントごとに最新 `per_account_limit` 件を
-    ///    残し、それ以外を削除 (`per_account_limit = None` ならスキップ)。
+    /// 削除順 (①③は単一 tx、②はチャンク分割 tx):
+    /// 1. **TTL**: `cached_at < now - ttl_days` の entity を削除 → CASCADE で所属連動。
+    /// 2. **Per-timeline トリム**: バケットごとに上位 `per_timeline_limit` 件を残し
+    ///    membership を削除。当該 victim のうちどのバケットにも所属しなくなった
+    ///    entity は同一チャンク tx 内で掃除する。Favorites/Clip バケットは
+    ///    added_at 降順 (= 初回ローカル取得時刻。サーバー上の追加時刻とは一致しない
+    ///    既知の制限)、他は sort_key 降順で残す。
+    ///    初回有効化は 1M 規模で分オーダーの削除になり得るため、victim を
+    ///    `TRIM_CHUNK_ROWS` 行ずつのチャンク tx に分割する (中断しても各チャンクは
+    ///    一貫状態で orphan を生まない — 未処理 victim は membership が残るため
+    ///    次回 cleanup が再計算して続きから削る)。
+    /// 3. **Per-account hard cap**: アカウントごとに `cached_at` 降順で
+    ///    `per_account_limit` 件を残し entity を削除 → CASCADE で所属連動。
     ///
-    /// 戻り値は削除した行数。`notes_fts` は `AFTER DELETE` トリガーで連動掃除される。
+    /// 戻り値は削除した entity + membership の総行数。`notes_fts` は
+    /// `AFTER DELETE` トリガーで連動掃除される。
     pub fn cleanup_with_eviction(&self, config: &EvictionConfig) -> Result<u64, NoteDeckError> {
-        // どちらも無効なら早期 return (lock も取らない)。
-        if config.per_account_limit.is_none() && config.ttl_days.is_none() {
+        // 全フィールド無効なら早期 return (lock も取らない)。
+        // per_timeline_limit を含む 3 フィールド判定であること (2 フィールド判定だと
+        // per-timeline のみ設定時にトリムが走らない)。
+        if config.per_account_limit.is_none()
+            && config.ttl_days.is_none()
+            && config.per_timeline_limit.is_none()
+        {
             return Ok(0);
         }
 
         let conn = self.lock_write()?;
-        let tx = conn.unchecked_transaction()?;
         let mut total_deleted: u64 = 0;
 
+        // ① TTL (単一 tx)
         if let Some(ttl_days) = config.ttl_days {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
             let ttl_cutoff = now - ttl_days * 86_400;
+            let tx = conn.unchecked_transaction()?;
             let n = tx.execute(
                 "DELETE FROM notes_cache WHERE cached_at < ?1",
                 params![ttl_cutoff],
             )?;
+            tx.commit()?;
             total_deleted += n as u64;
         }
 
+        // ② per-timeline トリム (チャンク分割 tx)
+        if let Some(per_timeline_limit) = config.per_timeline_limit {
+            total_deleted += self.trim_timelines_chunked(&conn, per_timeline_limit)?;
+        }
+
+        // ③ per-account hard cap (単一 tx)
         if let Some(per_account_limit) = config.per_account_limit {
+            let tx = conn.unchecked_transaction()?;
             // SQLite 3.25+ の window function で 1 クエリで評価。
             let n = tx.execute(
                 "DELETE FROM notes_cache
@@ -871,11 +1092,77 @@ impl Database {
                  )",
                 params![per_account_limit],
             )?;
+            tx.commit()?;
             total_deleted += n as u64;
         }
 
-        tx.commit()?;
         Ok(total_deleted)
+    }
+
+    /// per-timeline トリムの実体。victim (バケット上限超過の membership) を
+    /// チャンクごとの tx で削除し、victim のうち所属ゼロになった entity を
+    /// 同一 tx で掃除する。戻り値は削除した membership + entity の総行数。
+    fn trim_timelines_chunked(
+        &self,
+        conn: &Connection,
+        per_timeline_limit: i64,
+    ) -> Result<u64, NoteDeckError> {
+        let mut total: u64 = 0;
+        loop {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS trim_victims (
+                     account_id TEXT NOT NULL,
+                     timeline_key TEXT NOT NULL,
+                     note_id TEXT NOT NULL,
+                     PRIMARY KEY (account_id, timeline_key, note_id)
+                 ) WITHOUT ROWID;
+                 DELETE FROM trim_victims;",
+            )?;
+            // 残す順: Favorites/Clip は added_at 降順、他は sort_key 降順。
+            // チャンクの選び方は任意でよい (削除後に再計算するため最終形は不変)。
+            let picked = tx.execute(
+                "INSERT INTO trim_victims (account_id, timeline_key, note_id)
+                 SELECT account_id, timeline_key, note_id FROM (
+                     SELECT account_id, timeline_key, note_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY account_id, timeline_key
+                                ORDER BY
+                                    CASE WHEN timeline_key = 'favorites'
+                                              OR timeline_key LIKE 'clip:%'
+                                         THEN added_at END DESC,
+                                    sort_key DESC, note_id DESC
+                            ) AS rn
+                     FROM note_timelines
+                 )
+                 WHERE rn > ?1
+                 LIMIT ?2",
+                params![per_timeline_limit, TRIM_CHUNK_ROWS],
+            )?;
+            if picked == 0 {
+                tx.commit()?;
+                break;
+            }
+            // membership DELETE → 当該 victim 群の対象限定 entity 掃除 (同一 tx)
+            let memberships = tx.execute(
+                "DELETE FROM note_timelines
+                 WHERE (account_id, timeline_key, note_id) IN (
+                     SELECT account_id, timeline_key, note_id FROM trim_victims)",
+                [],
+            )?;
+            let entities = tx.execute(
+                "DELETE FROM notes_cache
+                 WHERE (note_id, account_id) IN (
+                     SELECT DISTINCT v.note_id, v.account_id FROM trim_victims v
+                     WHERE NOT EXISTS (SELECT 1 FROM note_timelines m
+                                       WHERE m.note_id = v.note_id
+                                         AND m.account_id = v.account_id))",
+                [],
+            )?;
+            tx.commit()?;
+            total += (memberships + entities) as u64;
+        }
+        Ok(total)
     }
 
     /// 1 度に最大 `INCREMENTAL_VACUUM_PAGES_PER_BOOT` ページを `auto_vacuum=INCREMENTAL`
@@ -922,13 +1209,19 @@ impl Database {
     }
 
     /// Delete a single note from the cache (e.g. when a deletion event is received).
-    pub fn delete_cached_note(&self, note_id: &str) -> Result<(), NoteDeckError> {
+    /// account スコープ (全アカウント一括削除の暗黙挙動を廃止)。所属は CASCADE で
+    /// 連動削除される。戻り値は entity が実在し削除されたか。
+    pub fn delete_cached_note(
+        &self,
+        account_id: &str,
+        note_id: &str,
+    ) -> Result<bool, NoteDeckError> {
         let conn = self.lock_write()?;
-        conn.execute(
-            "DELETE FROM notes_cache WHERE note_id = ?1",
-            params![note_id],
+        let n = conn.execute(
+            "DELETE FROM notes_cache WHERE note_id = ?1 AND account_id = ?2",
+            params![note_id, account_id],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Return (note_count, db_size_bytes).
@@ -947,46 +1240,71 @@ impl Database {
         Ok((count, page_count * page_size))
     }
 
-    /// Fetch cached notes created at or before the given ISO 8601 datetime.
+    /// カーソル以前のバケット内ノートを返す。
+    ///
+    /// keyset cursor: `before_note_id` が Some なら行値比較 `(sort_key, note_id) < (?, ?)`
+    /// (排他)、None なら `sort_key <= ?` (現行互換の包含比較。境界重複はフロント
+    /// dedup が吸収)。タイムスタンプ単独カーソルは同一 sort_key が limit 以上並ぶと
+    /// 前進不能になるため、呼び出し側は note_id を渡すこと。
     pub fn get_cached_timeline_before(
         &self,
         account_id: &str,
-        timeline_type: &str,
-        before: &str,
+        key: &TimelineKey,
+        before_sort_key: &str,
+        before_note_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
         let conn = self.lock_read()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT note_json FROM notes_cache
-             WHERE account_id = ?1 AND timeline_type = ?2 AND created_at <= ?3
-             ORDER BY created_at DESC
-             LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(params![account_id, timeline_type, before, limit], |row| {
-            let json_str: String = row.get(0)?;
-            Ok(json_str)
-        })?;
-        let mut notes = Vec::new();
-        for row in rows {
-            let json_str = row?;
-            if let Ok(note) = serde_json::from_str::<NormalizedNote>(&json_str) {
-                notes.push(note);
+        let canonical = key.as_canonical();
+        let jsons: Vec<String> = match before_note_id {
+            Some(note_id) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT e.note_json FROM note_timelines m
+                     JOIN notes_cache e ON e.note_id = m.note_id AND e.account_id = m.account_id
+                     WHERE m.account_id = ?1 AND m.timeline_key = ?2
+                       AND (m.sort_key, m.note_id) < (?3, ?4)
+                     ORDER BY m.sort_key DESC, m.note_id DESC
+                     LIMIT ?5",
+                )?;
+                let rows = stmt.query_map(
+                    params![account_id, canonical, before_sort_key, note_id, limit],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<rusqlite::Result<_>>()?
             }
-        }
-        Ok(notes)
+            None => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT e.note_json FROM note_timelines m
+                     JOIN notes_cache e ON e.note_id = m.note_id AND e.account_id = m.account_id
+                     WHERE m.account_id = ?1 AND m.timeline_key = ?2 AND m.sort_key <= ?3
+                     ORDER BY m.sort_key DESC, m.note_id DESC
+                     LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(
+                    params![account_id, canonical, before_sort_key, limit],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<rusqlite::Result<_>>()?
+            }
+        };
+        Ok(jsons
+            .iter()
+            .filter_map(|json| serde_json::from_str::<NormalizedNote>(json).ok())
+            .collect())
     }
 
-    /// Get the date range (min, max) of cached notes for a timeline.
+    /// バケットの sort_key 範囲 (min, max) を返す。sort_key = created_at の間は
+    /// 現行と同値。
     pub fn get_cache_date_range(
         &self,
         account_id: &str,
-        timeline_type: &str,
+        key: &TimelineKey,
     ) -> Result<Option<(String, String)>, NoteDeckError> {
         let conn = self.lock_read()?;
         let result: (Option<String>, Option<String>) = conn.query_row(
-            "SELECT MIN(created_at), MAX(created_at) FROM notes_cache
-             WHERE account_id = ?1 AND timeline_type = ?2",
-            params![account_id, timeline_type],
+            "SELECT MIN(sort_key), MAX(sort_key) FROM note_timelines
+             WHERE account_id = ?1 AND timeline_key = ?2",
+            params![account_id, key.as_canonical()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         match result {
@@ -1524,6 +1842,10 @@ mod tests {
         (dir, db)
     }
 
+    fn tk(s: &str) -> TimelineKey {
+        TimelineKey::parse(s).unwrap()
+    }
+
     // --- Migration tests ---
 
     #[test]
@@ -1622,7 +1944,8 @@ mod tests {
     }
 
     #[test]
-    fn notes_cache_has_timeline_type_column() {
+    fn notes_cache_has_no_timeline_type_column() {
+        // V6 で timeline_type 列は除去され、所属は note_timelines が持つ
         let (_dir, db) = temp_db();
         let conn = db.lock().unwrap();
         let has: bool = conn
@@ -1632,7 +1955,14 @@ mod tests {
             .unwrap()
             .query_row([], |row| row.get(0))
             .unwrap();
-        assert!(has);
+        assert!(!has);
+
+        let has_membership: bool = conn
+            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE name='note_timelines'")
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert!(has_membership);
     }
 
     // --- Account CRUD tests ---
@@ -1830,9 +2160,9 @@ mod tests {
     fn cache_note_and_retrieve() {
         let (_dir, db) = temp_db();
         let note = sample_note("note-1", "Hello world");
-        db.cache_notes(&[note], "home").unwrap();
+        db.ingest_notes(&[note], &tk("home")).unwrap();
 
-        let cached = db.get_cached_timeline("acc-1", "home", 10).unwrap();
+        let cached = db.get_cached_timeline("acc-1", &tk("home"), 10).unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].id, "note-1");
     }
@@ -1840,23 +2170,23 @@ mod tests {
     #[test]
     fn cache_note_delete() {
         let (_dir, db) = temp_db();
-        db.cache_notes(&[sample_note("note-1", "test")], "home")
+        db.ingest_notes(&[sample_note("note-1", "test")], &tk("home"))
             .unwrap();
-        db.delete_cached_note("note-1").unwrap();
+        db.delete_cached_note("acc-1", "note-1").unwrap();
 
-        let cached = db.get_cached_timeline("acc-1", "home", 10).unwrap();
+        let cached = db.get_cached_timeline("acc-1", &tk("home"), 10).unwrap();
         assert!(cached.is_empty());
     }
 
     #[test]
     fn fts_search_finds_cached_notes() {
         let (_dir, db) = temp_db();
-        db.cache_notes(
+        db.ingest_notes(
             &[
                 sample_note("n1", "Rust programming language"),
                 sample_note("n2", "Python scripting"),
             ],
-            "home",
+            &tk("home"),
         )
         .unwrap();
 
@@ -1886,11 +2216,11 @@ mod tests {
     #[test]
     fn fts_search_reflects_note_edit() {
         let (_dir, db) = temp_db();
-        db.cache_notes(&[sample_note("n1", "before edit text")], "home")
+        db.ingest_notes(&[sample_note("n1", "before edit text")], &tk("home"))
             .unwrap();
 
         // 同じノートが編集後のテキストで再キャッシュされる（Misskey のノート編集）
-        db.cache_notes(&[sample_note("n1", "after edit text")], "home")
+        db.ingest_notes(&[sample_note("n1", "after edit text")], &tk("home"))
             .unwrap();
 
         let hit_new = db.search_cached_notes("acc-1", "after", 10).unwrap();
@@ -1907,9 +2237,9 @@ mod tests {
         // text が null のノート（renote 等）が後からテキスト付きで再キャッシュされる
         let mut no_text = sample_note("n1", "");
         no_text.text = None;
-        db.cache_notes(&[no_text], "home").unwrap();
+        db.ingest_notes(&[no_text], &tk("home")).unwrap();
 
-        db.cache_notes(&[sample_note("n1", "now has text")], "home")
+        db.ingest_notes(&[sample_note("n1", "now has text")], &tk("home"))
             .unwrap();
 
         let results = db.search_cached_notes("acc-1", "now has", 10).unwrap();
@@ -1919,10 +2249,10 @@ mod tests {
     #[test]
     fn cache_date_range() {
         let (_dir, db) = temp_db();
-        db.cache_notes(&[sample_note("n1", "test")], "home")
+        db.ingest_notes(&[sample_note("n1", "test")], &tk("home"))
             .unwrap();
 
-        let range = db.get_cache_date_range("acc-1", "home").unwrap();
+        let range = db.get_cache_date_range("acc-1", &tk("home")).unwrap();
         assert!(range.is_some());
         let (oldest, newest) = range.unwrap();
         assert_eq!(oldest, newest); // single note
@@ -2002,9 +2332,9 @@ mod tests {
     #[test]
     fn cleanup_removes_notes_older_than_ttl() {
         let (_dir, db) = temp_db();
-        db.cache_note(&note_for_account("fresh", "acc-1"), "home")
+        db.ingest_notes(&[note_for_account("fresh", "acc-1")], &tk("home"))
             .unwrap();
-        db.cache_note(&note_for_account("stale", "acc-1"), "home")
+        db.ingest_notes(&[note_for_account("stale", "acc-1")], &tk("home"))
             .unwrap();
         // stale を 10 日前に偽装、TTL = 1 日でカット
         set_cached_at(&db, "stale", 0);
@@ -2017,11 +2347,13 @@ mod tests {
         let cfg = EvictionConfig {
             per_account_limit: Some(10_000),
             ttl_days: Some(1),
+            per_timeline_limit: None,
         };
         let deleted = db.cleanup_with_eviction(&cfg).unwrap();
         assert_eq!(deleted, 1);
 
-        let remaining: Vec<NormalizedNote> = db.get_cached_timeline("acc-1", "home", 100).unwrap();
+        let remaining: Vec<NormalizedNote> =
+            db.get_cached_timeline("acc-1", &tk("home"), 100).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "fresh");
     }
@@ -2031,7 +2363,7 @@ mod tests {
         let (_dir, db) = temp_db();
         // 5 件 insert (cached_at は now ですべて同程度)
         for i in 0..5 {
-            db.cache_note(&note_for_account(&format!("n{i}"), "acc-1"), "home")
+            db.ingest_notes(&[note_for_account(&format!("n{i}"), "acc-1")], &tk("home"))
                 .unwrap();
         }
         // 古い 2 件を 1 時間前に偽装 → cap=3 で削除されるのはこの 2 件
@@ -2041,11 +2373,13 @@ mod tests {
         let cfg = EvictionConfig {
             per_account_limit: Some(3),
             ttl_days: None, // TTL 無効で件数だけテスト
+            per_timeline_limit: None,
         };
         let deleted = db.cleanup_with_eviction(&cfg).unwrap();
         assert_eq!(deleted, 2);
 
-        let remaining: Vec<NormalizedNote> = db.get_cached_timeline("acc-1", "home", 100).unwrap();
+        let remaining: Vec<NormalizedNote> =
+            db.get_cached_timeline("acc-1", &tk("home"), 100).unwrap();
         assert_eq!(remaining.len(), 3);
         // n0 / n1 (古い) が消えて n2 / n3 / n4 が残る
         let mut ids: Vec<&str> = remaining.iter().map(|n| n.id.as_str()).collect();
@@ -2058,11 +2392,11 @@ mod tests {
         let (_dir, db) = temp_db();
         // acc-1 に 4 件、acc-2 に 2 件
         for i in 0..4 {
-            db.cache_note(&note_for_account(&format!("a{i}"), "acc-1"), "home")
+            db.ingest_notes(&[note_for_account(&format!("a{i}"), "acc-1")], &tk("home"))
                 .unwrap();
         }
         for i in 0..2 {
-            db.cache_note(&note_for_account(&format!("b{i}"), "acc-2"), "home")
+            db.ingest_notes(&[note_for_account(&format!("b{i}"), "acc-2")], &tk("home"))
                 .unwrap();
         }
         // acc-1 の古い 2 件
@@ -2073,6 +2407,7 @@ mod tests {
         let cfg = EvictionConfig {
             per_account_limit: Some(2),
             ttl_days: None,
+            per_timeline_limit: None,
         };
         let deleted = db.cleanup_with_eviction(&cfg).unwrap();
         assert_eq!(deleted, 2);
@@ -2085,12 +2420,13 @@ mod tests {
     fn cleanup_no_op_when_under_limits() {
         let (_dir, db) = temp_db();
         for i in 0..3 {
-            db.cache_note(&note_for_account(&format!("n{i}"), "acc-1"), "home")
+            db.ingest_notes(&[note_for_account(&format!("n{i}"), "acc-1")], &tk("home"))
                 .unwrap();
         }
         let cfg = EvictionConfig {
             per_account_limit: Some(100),
             ttl_days: None,
+            per_timeline_limit: None,
         };
         let deleted = db.cleanup_with_eviction(&cfg).unwrap();
         assert_eq!(deleted, 0);
@@ -2098,17 +2434,18 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_with_both_disabled_is_pure_noop() {
+    fn cleanup_with_all_disabled_is_pure_noop() {
         let (_dir, db) = temp_db();
         for i in 0..3 {
-            db.cache_note(&note_for_account(&format!("n{i}"), "acc-1"), "home")
+            db.ingest_notes(&[note_for_account(&format!("n{i}"), "acc-1")], &tk("home"))
                 .unwrap();
         }
-        // ttl_days=None かつ per_account_limit=None: ロックを取らずに 0 を返す。
+        // 3 フィールド全て None: ロックを取らずに 0 を返す。
         // 検索 UX 優先のデフォルトに近いケースをカバー。
         let cfg = EvictionConfig {
             per_account_limit: None,
             ttl_days: None,
+            per_timeline_limit: None,
         };
         let deleted = db.cleanup_with_eviction(&cfg).unwrap();
         assert_eq!(deleted, 0);
@@ -2119,13 +2456,14 @@ mod tests {
     fn cleanup_only_ttl_keeps_high_count() {
         let (_dir, db) = temp_db();
         for i in 0..5 {
-            db.cache_note(&note_for_account(&format!("n{i}"), "acc-1"), "home")
+            db.ingest_notes(&[note_for_account(&format!("n{i}"), "acc-1")], &tk("home"))
                 .unwrap();
         }
         // 5 件すべてが新しいので、TTL=1 でも何も消えない (cap は無効)
         let cfg = EvictionConfig {
             per_account_limit: None,
             ttl_days: Some(1),
+            per_timeline_limit: None,
         };
         let deleted = db.cleanup_with_eviction(&cfg).unwrap();
         assert_eq!(deleted, 0);
@@ -2156,7 +2494,7 @@ mod tests {
         let (_dir, db) = temp_db();
         // データ insert → 削除 → free page を生む
         for i in 0..50 {
-            db.cache_note(&note_for_account(&format!("n{i}"), "acc-1"), "home")
+            db.ingest_notes(&[note_for_account(&format!("n{i}"), "acc-1")], &tk("home"))
                 .unwrap();
         }
         db.clear_all_notes_cache().unwrap();
@@ -2536,7 +2874,7 @@ mod tests {
             scan_note("n3", "delta echo", 3),
             scan_note("n4", "alpha foxtrot", 4),
         ];
-        db.cache_notes(&notes, "home").unwrap();
+        db.ingest_notes(&notes, &tk("home")).unwrap();
     }
 
     #[test]
@@ -2670,7 +3008,7 @@ mod tests {
         seed_scan_notes(&db);
         let mut other = scan_note("n9", "alpha", 9);
         other.account_id = "acc-2".to_string();
-        db.cache_notes(&[other], "home").unwrap();
+        db.ingest_notes(&[other], &tk("home")).unwrap();
 
         let out = db
             .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
@@ -2699,5 +3037,529 @@ mod tests {
     fn fts_match_query_joins_with_and() {
         let q = build_fts_match_query(&["alpha".to_string(), "bravo".to_string()]).unwrap();
         assert_eq!(q, "\"alpha\" AND \"bravo\"");
+    }
+
+    // --- 実体/所属分離 (issue #30 仕様 v5) ---
+
+    fn note_with_created_at(id: &str, account_id: &str, created_at: &str) -> NormalizedNote {
+        let mut n = note_for_account(id, account_id);
+        n.created_at = created_at.to_string();
+        n
+    }
+
+    #[test]
+    fn note_belongs_to_multiple_timelines() {
+        // §9-2: home ∩ social の複数所属 (v5 以前は後勝ちで付け替わっていた現行バグ)
+        let (_dir, db) = temp_db();
+        let note = sample_note("n1", "both timelines");
+        db.ingest_notes(std::slice::from_ref(&note), &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[note], &tk("social")).unwrap();
+
+        let home = db.get_cached_timeline("acc-1", &tk("home"), 10).unwrap();
+        let social = db.get_cached_timeline("acc-1", &tk("social"), 10).unwrap();
+        assert_eq!(home.len(), 1, "home からも読めること");
+        assert_eq!(social.len(), 1, "social からも読めること");
+        // entity は 1 行のまま
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn ingest_with_param_key_is_readable() {
+        // §9-3: 孤児化解消 — antenna キーで ingest → 同じキーで読める
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[sample_note("n1", "from antenna")], &tk("antenna:a1"))
+            .unwrap();
+        let notes = db
+            .get_cached_timeline("acc-1", &tk("antenna:a1"), 10)
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn ingest_mixed_accounts_processes_per_note() {
+        // §9-12: 複数 account 混在配列の per-note 処理
+        let (_dir, db) = temp_db();
+        db.ingest_notes(
+            &[
+                note_for_account("n1", "acc-1"),
+                note_for_account("n2", "acc-2"),
+            ],
+            &tk("home"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.get_cached_timeline("acc-2", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn remove_membership_keeps_shared_entity() {
+        // §9-6: 他バケット所属 entity の生存
+        let (_dir, db) = temp_db();
+        let note = sample_note("n1", "shared");
+        db.ingest_notes(std::slice::from_ref(&note), &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[note], &tk("favorites")).unwrap();
+
+        let removed = db
+            .remove_membership("acc-1", &tk("favorites"), "n1")
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(db
+            .get_cached_timeline("acc-1", &tk("favorites"), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn remove_membership_sweeps_sole_entity() {
+        // §9-6: 単独所属 entity は同一 tx で掃除される
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[sample_note("n1", "only fav")], &tk("favorites"))
+            .unwrap();
+        let removed = db
+            .remove_membership("acc-1", &tk("favorites"), "n1")
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_membership_on_orphan_entity_returns_zero() {
+        // §9-6 追補 (R11-5): membership ゼロの orphan entity を巻き添え削除しない
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[sample_note("n1", "will be orphan")], &tk("home"))
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM note_timelines", []).unwrap();
+        }
+        let removed = db.remove_membership("acc-1", &tk("home"), "n1").unwrap();
+        assert_eq!(removed, 0, "membership 不在なら 0 を返す");
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 1, "entity は残す");
+    }
+
+    #[test]
+    fn clear_timeline_scoped_to_bucket_and_account() {
+        // §9-6: バケット破棄 — 他バケット所属は生存・単独所属は掃除・他アカウント非干渉
+        let (_dir, db) = temp_db();
+        let shared = note_for_account("shared", "acc-1");
+        db.ingest_notes(std::slice::from_ref(&shared), &tk("antenna:a1"))
+            .unwrap();
+        db.ingest_notes(&[shared], &tk("home")).unwrap();
+        db.ingest_notes(&[note_for_account("sole", "acc-1")], &tk("antenna:a1"))
+            .unwrap();
+        db.ingest_notes(&[note_for_account("other", "acc-2")], &tk("antenna:a1"))
+            .unwrap();
+
+        // membership 3 行 (shared/sole の antenna:a1 = 2、sole entity の CASCADE 1 は
+        // 数えない → shared 1 + sole 1(entity 先行 CASCADE) = 2
+        let removed = db.clear_timeline("acc-1", &tk("antenna:a1")).unwrap();
+        assert_eq!(removed, 2);
+        assert!(db
+            .get_cached_timeline("acc-1", &tk("antenna:a1"), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 1, "sole は掃除");
+        assert_eq!(
+            db.account_cache_count("acc-2").unwrap(),
+            1,
+            "他アカウント非干渉"
+        );
+    }
+
+    #[test]
+    fn delete_cached_note_is_account_scoped() {
+        // §9-7: 同一 note_id でも他アカウントの entity は残る
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[note_for_account("n1", "acc-1")], &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[note_for_account("n1", "acc-2")], &tk("home"))
+            .unwrap();
+
+        assert!(db.delete_cached_note("acc-1", "n1").unwrap());
+        assert!(db
+            .get_cached_timeline("acc-1", &tk("home"), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.get_cached_timeline("acc-2", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // 二度目は false
+        assert!(!db.delete_cached_note("acc-1", "n1").unwrap());
+    }
+
+    #[test]
+    fn sweep_orphan_notes_removes_only_orphans() {
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[sample_note("kept", "has membership")], &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[sample_note("orphan", "loses membership")], &tk("home"))
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM note_timelines WHERE note_id = 'orphan'", [])
+                .unwrap();
+        }
+        assert_eq!(db.sweep_orphan_notes().unwrap(), 1);
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn keyset_paging_advances_through_equal_sort_keys() {
+        // §9-8: 同一 sort_key が limit 超で並んでも note_id tie-break で前進する
+        let (_dir, db) = temp_db();
+        let same_ts = "2025-06-01T00:00:00Z";
+        let notes: Vec<NormalizedNote> = (0..5)
+            .map(|i| note_with_created_at(&format!("n{i}"), "acc-1", same_ts))
+            .collect();
+        db.ingest_notes(&notes, &tk("home")).unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(String, String)> = None;
+        loop {
+            let page = match &cursor {
+                None => db.get_cached_timeline("acc-1", &tk("home"), 2).unwrap(),
+                Some((sk, nid)) => db
+                    .get_cached_timeline_before("acc-1", &tk("home"), sk, Some(nid), 2)
+                    .unwrap(),
+            };
+            if page.is_empty() {
+                break;
+            }
+            for n in &page {
+                seen.push(n.id.clone());
+            }
+            let last = page.last().unwrap();
+            cursor = Some((last.created_at.clone(), last.id.clone()));
+        }
+        assert_eq!(seen.len(), 5, "重複・欠落なく全件回収");
+        let mut dedup = seen.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), 5);
+    }
+
+    #[test]
+    fn timeline_before_without_note_id_is_inclusive() {
+        // note_id なしは現行互換の包含比較 (境界重複はフロント dedup が吸収)
+        let (_dir, db) = temp_db();
+        db.ingest_notes(
+            &[
+                note_with_created_at("n1", "acc-1", "2025-06-01T00:00:00Z"),
+                note_with_created_at("n2", "acc-1", "2025-06-02T00:00:00Z"),
+            ],
+            &tk("home"),
+        )
+        .unwrap();
+        let page = db
+            .get_cached_timeline_before("acc-1", &tk("home"), "2025-06-01T00:00:00Z", None, 10)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "n1");
+    }
+
+    #[test]
+    fn ttl_cascade_removes_memberships() {
+        // §9-5: TTL の entity 削除が CASCADE で所属を道連れにする
+        let (_dir, db) = temp_db();
+        let note = sample_note("n1", "old note");
+        db.ingest_notes(std::slice::from_ref(&note), &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[note], &tk("social")).unwrap();
+        set_cached_at(&db, "n1", 1000);
+
+        let cfg = EvictionConfig {
+            per_account_limit: None,
+            ttl_days: Some(1),
+            per_timeline_limit: None,
+        };
+        db.cleanup_with_eviction(&cfg).unwrap();
+        assert!(db
+            .get_cached_timeline("acc-1", &tk("home"), 10)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .get_cached_timeline("acc-1", &tk("social"), 10)
+            .unwrap()
+            .is_empty());
+        let conn = db.lock().unwrap();
+        let memberships: i64 = conn
+            .query_row("SELECT COUNT(*) FROM note_timelines", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(memberships, 0);
+    }
+
+    #[test]
+    fn per_timeline_trim_runs_when_only_it_is_set() {
+        // §9-5: per_timeline_limit のみ設定でもトリムが走る (早期 return 回帰)
+        let (_dir, db) = temp_db();
+        for i in 0..5 {
+            db.ingest_notes(
+                &[note_with_created_at(
+                    &format!("n{i}"),
+                    "acc-1",
+                    &format!("2025-06-0{}T00:00:00Z", i + 1),
+                )],
+                &tk("home"),
+            )
+            .unwrap();
+        }
+        let cfg = EvictionConfig {
+            per_account_limit: None,
+            ttl_days: None,
+            per_timeline_limit: Some(2),
+        };
+        let deleted = db.cleanup_with_eviction(&cfg).unwrap();
+        // membership 3 + orphan entity 3
+        assert_eq!(deleted, 6);
+        let remaining = db.get_cached_timeline("acc-1", &tk("home"), 10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        // sort_key 降順で最新 2 件が残る
+        assert_eq!(remaining[0].id, "n4");
+        assert_eq!(remaining[1].id, "n3");
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 2);
+    }
+
+    #[test]
+    fn per_timeline_trim_keeps_shared_entities() {
+        // §9-5: トリムで membership を失っても他バケット所属の entity は残る
+        let (_dir, db) = temp_db();
+        for i in 0..3 {
+            let note = note_with_created_at(
+                &format!("n{i}"),
+                "acc-1",
+                &format!("2025-06-0{}T00:00:00Z", i + 1),
+            );
+            db.ingest_notes(std::slice::from_ref(&note), &tk("home"))
+                .unwrap();
+            db.ingest_notes(&[note], &tk("social")).unwrap();
+        }
+        let cfg = EvictionConfig {
+            per_account_limit: None,
+            ttl_days: None,
+            per_timeline_limit: Some(1),
+        };
+        db.cleanup_with_eviction(&cfg).unwrap();
+        // home / social とも最新 1 件ずつ残り、entity は共有されているため
+        // どちらのバケットの生存分も account_cache_count に含まれる
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("social"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 1);
+    }
+
+    #[test]
+    fn per_timeline_trim_uses_added_at_for_favorites() {
+        // §9-5: Favorites バケットは added_at (初回取得時刻) 降順で残す
+        let (_dir, db) = temp_db();
+        // created_at は新しいが最初に取得されたノート
+        db.ingest_notes(
+            &[note_with_created_at(
+                "newer-first",
+                "acc-1",
+                "2025-06-09T00:00:00Z",
+            )],
+            &tk("favorites"),
+        )
+        .unwrap();
+        // created_at は古いが後から取得された (backfill) ノート
+        db.ingest_notes(
+            &[note_with_created_at(
+                "older-later",
+                "acc-1",
+                "2025-01-01T00:00:00Z",
+            )],
+            &tk("favorites"),
+        )
+        .unwrap();
+        {
+            // added_at を明示的に差別化 (同秒対策)
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE note_timelines SET added_at = 100 WHERE note_id = 'newer-first'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE note_timelines SET added_at = 200 WHERE note_id = 'older-later'",
+                [],
+            )
+            .unwrap();
+        }
+        let cfg = EvictionConfig {
+            per_account_limit: None,
+            ttl_days: None,
+            per_timeline_limit: Some(1),
+        };
+        db.cleanup_with_eviction(&cfg).unwrap();
+        let remaining = db
+            .get_cached_timeline("acc-1", &tk("favorites"), 10)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].id, "older-later",
+            "added_at が新しい方 (後から取得) が残る"
+        );
+    }
+
+    #[test]
+    fn clear_account_cache_removes_memberships() {
+        // §9-11: clear 系の membership 連動
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[note_for_account("n1", "acc-1")], &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[note_for_account("n2", "acc-2")], &tk("home"))
+            .unwrap();
+        db.clear_account_cache("acc-1").unwrap();
+        {
+            let conn = db.lock().unwrap();
+            let memberships: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM note_timelines WHERE account_id = 'acc-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(memberships, 0);
+        }
+        assert_eq!(
+            db.get_cached_timeline("acc-2", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        db.clear_all_notes_cache().unwrap();
+        let conn = db.lock().unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM note_timelines", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn cascade_delete_uses_membership_index_with_stat1() {
+        // §9-17: stat1 存在下で親 DELETE の CASCADE が idx_note_timelines_note を使う
+        // (stat1 なしだと WITHOUT ROWID PK の prefix スキャンに落ちる — 実測 2000 倍差)
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[sample_note("n1", "note")], &tk("home"))
+            .unwrap();
+        let conn = db.lock().unwrap();
+        conn.execute_batch("ANALYZE;").unwrap();
+        let plan: String = conn
+            .prepare("EXPLAIN QUERY PLAN DELETE FROM notes_cache WHERE note_id = 'n1' AND account_id = 'acc-1'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_note_timelines_note"),
+            "CASCADE の子スキャンが idx_note_timelines_note を使うこと: {plan}"
+        );
+    }
+
+    #[test]
+    fn v6_migrates_old_timeline_type_rows() {
+        // §9-4: V5 時点の旧 DB fixture → V6 適用で membership 復元・壊れキー消滅・FTS 健全
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("old.db");
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(PRAGMAS_WRITER).unwrap();
+            embedded::migrations::runner()
+                .set_grouped(true)
+                .set_target(refinery::Target::Version(5))
+                .run(&mut conn)
+                .unwrap();
+            // 旧形式の行を直接 INSERT (正キー 2 種 + 壊れキー 2 種)
+            let insert = |id: &str, tl: &str| {
+                conn.execute(
+                    "INSERT INTO notes_cache (note_id, account_id, server_host, created_at, text, note_json, cached_at, timeline_type)
+                     VALUES (?1, 'acc-1', 'misskey.io', '2025-01-01T00:00:00Z', 'migration test text', ?2, 42, ?3)",
+                    params![
+                        id,
+                        serde_json::to_string(&sample_note(id, "migration test text")).unwrap(),
+                        tl
+                    ],
+                )
+                .unwrap();
+            };
+            insert("good-home", "home");
+            insert("good-antenna", "antenna:a1");
+            insert("broken-empty", "");
+            insert("broken-userlist", "user-list");
+        }
+        // 再 open で V6 が適用される
+        let db = Database::open(&db_path).unwrap();
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("home"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("antenna:a1"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // 壊れキー行は migration 内 DELETE で消滅
+        assert_eq!(db.account_cache_count("acc-1").unwrap(), 2);
+        // added_at = 旧 cached_at の近似移行
+        {
+            let conn = db.lock().unwrap();
+            let added_at: i64 = conn
+                .query_row(
+                    "SELECT added_at FROM note_timelines WHERE note_id = 'good-home'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(added_at, 42);
+            // FTS integrity-check が通る
+            conn.execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check');")
+                .unwrap();
+        }
+        // FTS 検索が移行後も動く
+        let hits = db.search_cached_notes("acc-1", "migration", 10).unwrap();
+        assert_eq!(hits.len(), 2);
     }
 }
