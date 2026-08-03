@@ -207,23 +207,35 @@ pub enum Commands {
     #[command(
         long_about = "指定したタイプのタイムラインからノートを取得します。\n\n\
             タイプ:\n\
-            \x20 home   - ホームタイムライン（フォロー中のユーザーの投稿）\n\
-            \x20 local  - ローカルタイムライン（同じインスタンスの投稿）\n\
-            \x20 social - ソーシャルタイムライン（ローカル + フォロー中）\n\
-            \x20 global - グローバルタイムライン（連合の全投稿）",
+            \x20 home            - ホームタイムライン（フォロー中のユーザーの投稿）\n\
+            \x20 local           - ローカルタイムライン（同じインスタンスの投稿）\n\
+            \x20 social          - ソーシャルタイムライン（ローカル + フォロー中）\n\
+            \x20 global          - グローバルタイムライン（連合の全投稿）\n\
+            \x20 antenna:{id}    - アンテナ\n\
+            \x20 channel:{id}    - チャンネル\n\
+            \x20 role:{id}       - ロールタイムライン\n\
+            \x20 user-list:{id}  - ユーザーリスト\n\
+            \x20 user:{id}       - ユーザーの投稿\n\
+            \x20 mentions        - あなた宛て\n\
+            フォーク独自のベーシック TL (bubble 等) もそのまま指定できます。",
         after_long_help = "使用例:\n\
             \x20 notecli timeline\n\
             \x20 notecli timeline local -l 10\n\
+            \x20 notecli timeline antenna:9abcdef12345\n\
             \x20 notecli timeline -c | fzf --with-nth=2.. | cut -f1"
     )]
     Timeline {
-        /// タイムラインの種類: home, local, social, global
+        /// タイムラインの種類 (home, local, social, global, antenna:{id} 等)
         #[arg(default_value = "home")]
         r#type: String,
         /// 取得するノート数 (1-100)
         #[arg(long, short, default_value_t = 20)]
         limit: i64,
     },
+
+    /// ローカルノートキャッシュの管理
+    #[command(subcommand)]
+    Cache(CacheCommands),
 
     /// ノートを全文検索
     #[command(
@@ -419,6 +431,17 @@ pub enum Commands {
             リアクションに使える絵文字を確認するのに便利です。"
     )]
     Emojis,
+}
+
+#[derive(Subcommand)]
+pub enum CacheCommands {
+    /// どのタイムラインにも属さない孤児ノート実体を掃除
+    #[command(
+        long_about = "どのタイムラインにも属さないノート実体 (orphan) をキャッシュ DB から\n\
+            削除します。通常運用では所属を失った実体は同一トランザクションで掃除される\n\
+            ため、これは修復用の手動コマンドです。"
+    )]
+    Sweep,
 }
 
 #[cfg(test)]

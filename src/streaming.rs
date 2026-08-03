@@ -16,7 +16,7 @@ use crate::event_bus::{EventBus, SseEvent};
 use crate::models::{
     ChatMessage, ChatReactionUser, NormalizedNote, NormalizedNotification, NoteReactedBody,
     NoteUnreactedBody, NoteUpdateBody, RawEmoji, RawNote, RawNotification, ServerEmoji,
-    TimelineOptions, TimelineType,
+    TimelineKey, TimelineOptions,
 };
 
 /// Trait for emitting events to a frontend (e.g., Tauri WebView).
@@ -369,23 +369,71 @@ struct PollingHandle {
 
 // --- Subscription tracking ---
 
+/// 購読対象の正本。WS チャンネル名・params・キャッシュキーを全てここから導出する
+/// (層ごとのキー手組みを型レベルで排除する — issue #30 仕様 v5 §4)。
+#[derive(Debug, Clone, PartialEq)]
+enum SubscriptionTarget {
+    /// ノート系タイムライン購読 (キャッシュ書込あり)
+    Notes(TimelineKey),
+    /// main チャンネル (通知・メンション等)
+    Main,
+    ChatUser {
+        other_id: String,
+    },
+    ChatRoom {
+        room_id: String,
+    },
+}
+
+impl SubscriptionTarget {
+    /// WS チャンネル名と基本 params。streaming 購読を持たない Notes 種別
+    /// (Favorites / Clip / UserNotes / Mentions / Specified) は None。
+    fn ws_channel(&self) -> Option<(std::borrow::Cow<'static, str>, Option<Value>)> {
+        use std::borrow::Cow;
+        match self {
+            Self::Notes(key) => key.ws_channel(),
+            Self::Main => Some((Cow::Borrowed("main"), None)),
+            Self::ChatUser { other_id } => Some((
+                Cow::Borrowed("chatUser"),
+                Some(json!({ "otherId": other_id })),
+            )),
+            Self::ChatRoom { room_id } => Some((
+                Cow::Borrowed("chatRoom"),
+                Some(json!({ "roomId": room_id })),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SubscriptionInfo {
     account_id: String,
     host: String,
-    /// "timeline", "antenna", "channel", "main", or "chat"
-    kind: String,
-    /// The Misskey channel name (e.g. "homeTimeline", "main")
-    channel: String,
-    /// Original timeline type (e.g. "home", "local") for cache isolation
-    timeline_type: String,
-    /// Extra params for channel subscription (e.g. listId for userListTimeline)
-    params: Option<Value>,
+    /// 購読対象。チャンネル名・params・キャッシュキーの導出元。
+    target: SubscriptionTarget,
+    /// 追加 params のマージ点 (WS フィルタ等の将来拡張用)。reconnect replay /
+    /// resume でも維持される。
+    extra_params: Option<Value>,
     /// Whether this subscription is actively connected/polled.
     ///
     /// Suspended subscriptions keep their metadata for viewport-based resume and
     /// reconnect replay, but stop receiving work from the upstream server.
     active: bool,
+}
+
+impl SubscriptionInfo {
+    /// 購読送信に使うチャンネル名と params (extra_params をマージ済み。extra が勝つ)。
+    fn channel_and_params(&self) -> Option<(std::borrow::Cow<'static, str>, Option<Value>)> {
+        let (channel, base) = self.target.ws_channel()?;
+        let params = match (base, self.extra_params.clone()) {
+            (Some(Value::Object(mut b)), Some(Value::Object(e))) => {
+                b.extend(e);
+                Some(Value::Object(b))
+            }
+            (base, extra) => extra.or(base),
+        };
+        Some((channel, params))
+    }
 }
 
 pub struct StreamingManager {
@@ -435,7 +483,8 @@ impl StreamingManager {
             } else {
                 StreamConnectionState::Reconnecting
             };
-            self.emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
+            self.emitter
+                .emit(StreamEvent::Status(Box::new(StreamStatusEvent {
                     account_id: account_id.to_string(),
                     state,
                 })));
@@ -463,7 +512,10 @@ impl StreamingManager {
                 None
             }
             Err(_) => {
-                tracing::warn!(account_id, "initial connect timed out; retrying in background");
+                tracing::warn!(
+                    account_id,
+                    "initial connect timed out; retrying in background"
+                );
                 None
             }
         };
@@ -513,7 +565,8 @@ impl StreamingManager {
             },
         );
 
-        self.emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
+        self.emitter
+            .emit(StreamEvent::Status(Box::new(StreamStatusEvent {
                 account_id: account_id.to_string(),
                 state: if connected {
                     StreamConnectionState::Connected
@@ -556,7 +609,8 @@ impl StreamingManager {
         captured.remove(account_id);
         drop(captured);
 
-        self.emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
+        self.emitter
+            .emit(StreamEvent::Status(Box::new(StreamStatusEvent {
                 account_id: account_id.to_string(),
                 state: StreamConnectionState::Disconnected,
             })));
@@ -598,7 +652,8 @@ impl StreamingManager {
                 let interval = Duration::from_millis(interval_ms.unwrap_or(15_000));
                 self.start_polling(account_id, host, token, interval).await;
 
-                self.emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
+                self.emitter
+                    .emit(StreamEvent::Status(Box::new(StreamStatusEvent {
                         account_id: account_id.to_string(),
                         state: StreamConnectionState::Connected,
                     })));
@@ -659,122 +714,22 @@ impl StreamingManager {
         );
     }
 
-    pub async fn subscribe_timeline(
+    /// ノート系タイムライン購読の単一エントリポイント。チャンネル名・params・
+    /// キャッシュキーは全て `key` から導出する。streaming 購読を持たない種別
+    /// (Favorites 等 — `ws_channel() == None`) は Err。
+    pub async fn subscribe_notes(
         &self,
         account_id: &str,
-        timeline_type: TimelineType,
-        list_id: Option<String>,
+        key: TimelineKey,
+        extra_params: Option<Value>,
     ) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        let channel = timeline_type.ws_channel();
-        let params = list_id.as_ref().map(|id| json!({ "listId": id }));
-
-        let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, &channel, &sub_id, params.clone())
-            .await?;
-
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "timeline".to_string(),
-                channel: channel.clone(),
-                timeline_type: timeline_type.as_str().to_string(),
-                params,
-                active: true,
-            },
-        );
-
-        Ok(sub_id)
-    }
-
-    pub async fn subscribe_antenna(
-        &self,
-        account_id: &str,
-        antenna_id: &str,
-    ) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        let params = Some(json!({ "antennaId": antenna_id }));
-
-        let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, "antenna", &sub_id, params.clone())
-            .await?;
-
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "antenna".to_string(),
-                channel: "antenna".to_string(),
-                timeline_type: String::new(),
-                params,
-                active: true,
-            },
-        );
-
-        Ok(sub_id)
-    }
-
-    pub async fn subscribe_channel(
-        &self,
-        account_id: &str,
-        channel_id: &str,
-    ) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        let params = Some(json!({ "channelId": channel_id }));
-
-        let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, "channel", &sub_id, params.clone())
-            .await?;
-
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "channel".to_string(),
-                channel: "channel".to_string(),
-                timeline_type: String::new(),
-                params,
-                active: true,
-            },
-        );
-
-        Ok(sub_id)
-    }
-
-    pub async fn subscribe_role(
-        &self,
-        account_id: &str,
-        role_id: &str,
-    ) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        let params = Some(json!({ "roleId": role_id }));
-
-        let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, "roleTimeline", &sub_id, params.clone())
-            .await?;
-
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "role".to_string(),
-                channel: "roleTimeline".to_string(),
-                timeline_type: String::new(),
-                params,
-                active: true,
-            },
-        );
-
-        Ok(sub_id)
+        if key.ws_channel().is_none() {
+            return Err(NoteDeckError::InvalidInput(format!(
+                "timeline key '{key}' has no streaming channel"
+            )));
+        }
+        self.subscribe_target(account_id, SubscriptionTarget::Notes(key), extra_params)
+            .await
     }
 
     pub async fn subscribe_chat_user(
@@ -782,28 +737,14 @@ impl StreamingManager {
         account_id: &str,
         other_id: &str,
     ) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        let params = Some(json!({ "otherId": other_id }));
-
-        let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, "chatUser", &sub_id, params.clone())
-            .await?;
-
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "chat".to_string(),
-                channel: "chatUser".to_string(),
-                timeline_type: String::new(),
-                params,
-                active: true,
+        self.subscribe_target(
+            account_id,
+            SubscriptionTarget::ChatUser {
+                other_id: other_id.to_string(),
             },
-        );
-
-        Ok(sub_id)
+            None,
+        )
+        .await
     }
 
     pub async fn subscribe_chat_room(
@@ -811,50 +752,44 @@ impl StreamingManager {
         account_id: &str,
         room_id: &str,
     ) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        let params = Some(json!({ "roomId": room_id }));
-
-        let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, "chatRoom", &sub_id, params.clone())
-            .await?;
-
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "chat".to_string(),
-                channel: "chatRoom".to_string(),
-                timeline_type: String::new(),
-                params,
-                active: true,
+        self.subscribe_target(
+            account_id,
+            SubscriptionTarget::ChatRoom {
+                room_id: room_id.to_string(),
             },
-        );
-
-        Ok(sub_id)
+            None,
+        )
+        .await
     }
 
     pub async fn subscribe_main(&self, account_id: &str) -> Result<String, NoteDeckError> {
-        let sub_id = uuid::Uuid::new_v4().to_string();
+        self.subscribe_target(account_id, SubscriptionTarget::Main, None)
+            .await
+    }
 
+    async fn subscribe_target(
+        &self,
+        account_id: &str,
+        target: SubscriptionTarget,
+        extra_params: Option<Value>,
+    ) -> Result<String, NoteDeckError> {
+        let sub_id = uuid::Uuid::new_v4().to_string();
         let host = self.get_host(account_id).await?;
-        self.send_subscribe(account_id, "main", &sub_id, None)
+        let info = SubscriptionInfo {
+            account_id: account_id.to_string(),
+            host,
+            target,
+            extra_params,
+            active: true,
+        };
+        let (channel, params) = info.channel_and_params().ok_or_else(|| {
+            NoteDeckError::InvalidInput("subscription target has no streaming channel".to_string())
+        })?;
+        self.send_subscribe(account_id, &channel, &sub_id, params)
             .await?;
 
         let mut subs = self.subscriptions.write().await;
-        subs.insert(
-            sub_id.clone(),
-            SubscriptionInfo {
-                account_id: account_id.to_string(),
-                host,
-                kind: "main".to_string(),
-                channel: "main".to_string(),
-                timeline_type: String::new(),
-                params: None,
-                active: true,
-            },
-        );
+        subs.insert(sub_id.clone(), info);
 
         Ok(sub_id)
     }
@@ -921,7 +856,7 @@ impl StreamingManager {
         account_id: &str,
         subscription_id: &str,
     ) -> Result<(), NoteDeckError> {
-        let (channel, params, was_active) = {
+        let (channel_params, was_active) = {
             let subs = self.subscriptions.read().await;
             let info = subs
                 .get(subscription_id)
@@ -931,11 +866,14 @@ impl StreamingManager {
                     "subscription account mismatch".to_string(),
                 ));
             }
-            (info.channel.clone(), info.params.clone(), info.active)
+            (info.channel_and_params(), info.active)
         };
         if was_active {
             return Ok(());
         }
+        let (channel, params) = channel_params.ok_or_else(|| {
+            NoteDeckError::InvalidInput("subscription target has no streaming channel".to_string())
+        })?;
 
         self.send_subscribe(account_id, &channel, subscription_id, params)
             .await?;
@@ -1115,9 +1053,9 @@ async fn connection_task(
     loop {
         connected_flag.store(false, Ordering::Relaxed);
         emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
-                account_id: account_id.clone(),
-                state: StreamConnectionState::Reconnecting,
-            })));
+            account_id: account_id.clone(),
+            state: StreamConnectionState::Reconnecting,
+        })));
 
         // Wait with backoff, but listen for Shutdown during the wait.
         // Equal Jitter (sleep in [backoff/2, backoff]) de-syncs reconnects
@@ -1158,9 +1096,9 @@ async fn connection_task(
                 connected_flag.store(true, Ordering::Relaxed);
 
                 emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
-                        account_id: account_id.clone(),
-                        state: StreamConnectionState::Connected,
-                    })));
+                    account_id: account_id.clone(),
+                    state: StreamConnectionState::Connected,
+                })));
 
                 let reason = run_ws_session(
                     &emitter,
@@ -1217,7 +1155,10 @@ async fn run_ws_session(
         let subs = subscriptions.read().await;
         subs.iter()
             .filter(|(_, info)| info.account_id == account_id && info.active)
-            .map(|(sub_id, info)| (sub_id.clone(), info.channel.clone(), info.params.clone()))
+            .filter_map(|(sub_id, info)| {
+                info.channel_and_params()
+                    .map(|(channel, params)| (sub_id.clone(), channel.into_owned(), params))
+            })
             .collect()
     };
 
@@ -1448,7 +1389,11 @@ async fn handle_ws_message(
                 note_id,
                 update,
             };
-            emit_both(emitter, event_bus, StreamEvent::NoteCaptureUpdated(Box::new(payload)));
+            emit_both(
+                emitter,
+                event_bus,
+                StreamEvent::NoteCaptureUpdated(Box::new(payload)),
+            );
         }
         return;
     }
@@ -1491,7 +1436,11 @@ async fn handle_ws_message(
             change,
             emojis,
         };
-        emit_both(emitter, event_bus, StreamEvent::EmojiChanged(Box::new(payload)));
+        emit_both(
+            emitter,
+            event_bus,
+            StreamEvent::EmojiChanged(Box::new(payload)),
+        );
         return;
     }
 
@@ -1520,23 +1469,34 @@ async fn handle_ws_message(
         _ => return,
     };
 
-    let (kind, host, timeline_type) = {
+    let (target, host) = {
         let subs = subscriptions.read().await;
         match subs.get(&sub_id) {
-            Some(i) => (i.kind.clone(), i.host.clone(), i.timeline_type.clone()),
+            Some(i) => (i.target.clone(), i.host.clone()),
             None => return,
         }
     };
 
-    let is_note_channel = matches!(kind.as_str(), "timeline" | "antenna" | "channel" | "role");
+    let note_key = match &target {
+        SubscriptionTarget::Notes(key) => Some(key.clone()),
+        _ => None,
+    };
+    let is_note_channel = note_key.is_some();
+    let is_main = matches!(target, SubscriptionTarget::Main);
+    let is_chat = matches!(
+        target,
+        SubscriptionTarget::ChatUser { .. } | SubscriptionTarget::ChatRoom { .. }
+    );
 
     if is_note_channel && event_type == "note" {
         if let Ok(raw) = serde_json::from_value::<RawNote>(event_body) {
+            let key = note_key.expect("is_note_channel implies note_key");
             let note = Arc::new(raw.normalize(account_id, &host));
             let db = db.clone();
             let note_for_cache = Arc::clone(&note);
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = db.cache_note(&note_for_cache, &timeline_type) {
+                if let Err(e) = db.ingest_notes(std::slice::from_ref(note_for_cache.as_ref()), &key)
+                {
                     tracing::warn!(error = %e, "failed to cache streamed note");
                 }
             });
@@ -1573,8 +1533,12 @@ async fn handle_ws_message(
             note_id,
             update,
         };
-        emit_both(emitter, event_bus, StreamEvent::NoteUpdated(Box::new(payload)));
-    } else if kind == "main" {
+        emit_both(
+            emitter,
+            event_bus,
+            StreamEvent::NoteUpdated(Box::new(payload)),
+        );
+    } else if is_main {
         if event_type == "notification" {
             if let Ok(raw) = serde_json::from_value::<RawNotification>(event_body) {
                 let notification = raw.normalize(account_id, &host);
@@ -1583,7 +1547,11 @@ async fn handle_ws_message(
                     subscription_id: sub_id,
                     notification,
                 };
-                emit_both(emitter, event_bus, StreamEvent::Notification(Box::new(payload)));
+                emit_both(
+                    emitter,
+                    event_bus,
+                    StreamEvent::Notification(Box::new(payload)),
+                );
             }
         } else if event_type == "mention" || event_type == "reply" {
             // main-event として emit しつつ、mention としても parse を試みる
@@ -1610,9 +1578,13 @@ async fn handle_ws_message(
                 event_type,
                 body: event_body,
             };
-            emit_both(emitter, event_bus, StreamEvent::MainEvent(Box::new(payload)));
+            emit_both(
+                emitter,
+                event_bus,
+                StreamEvent::MainEvent(Box::new(payload)),
+            );
         }
-    } else if kind == "chat" {
+    } else if is_chat {
         if event_type == "message" {
             if let Ok(mut msg) = serde_json::from_value::<ChatMessage>(event_body) {
                 // Misskey 本家の chat:message WS event は Lite packer 固定で
@@ -1647,7 +1619,11 @@ async fn handle_ws_message(
                     subscription_id: sub_id,
                     message: msg,
                 };
-                emit_both(emitter, event_bus, StreamEvent::ChatMessage(Box::new(payload)));
+                emit_both(
+                    emitter,
+                    event_bus,
+                    StreamEvent::ChatMessage(Box::new(payload)),
+                );
             }
         } else if event_type == "deleted" {
             if let Some(id) = event_body.as_str() {
@@ -1668,7 +1644,11 @@ async fn handle_ws_message(
                     subscription_id: sub_id,
                     message_id: id_owned,
                 };
-                emit_both(emitter, event_bus, StreamEvent::ChatMessageDeleted(Box::new(payload)));
+                emit_both(
+                    emitter,
+                    event_bus,
+                    StreamEvent::ChatMessageDeleted(Box::new(payload)),
+                );
             }
         } else if event_type == "react" || event_type == "unreact" {
             let is_react = event_type == "react";
@@ -1698,7 +1678,11 @@ async fn handle_ws_message(
                         reaction: body.reaction,
                         user: body.user,
                     };
-                    emit_both(emitter, event_bus, StreamEvent::ChatMessageReacted(Box::new(payload)));
+                    emit_both(
+                        emitter,
+                        event_bus,
+                        StreamEvent::ChatMessageReacted(Box::new(payload)),
+                    );
                 } else {
                     let payload = StreamChatMessageUnreactedEvent {
                         account_id: account_id.to_string(),
@@ -1707,7 +1691,11 @@ async fn handle_ws_message(
                         reaction: body.reaction,
                         user: body.user,
                     };
-                    emit_both(emitter, event_bus, StreamEvent::ChatMessageUnreacted(Box::new(payload)));
+                    emit_both(
+                        emitter,
+                        event_bus,
+                        StreamEvent::ChatMessageUnreacted(Box::new(payload)),
+                    );
                 }
             }
         }
@@ -1752,34 +1740,34 @@ async fn polling_loop(
             return;
         }
 
-        // Collect timeline subscriptions for this account
-        let subs_snapshot: Vec<(String, SubscriptionInfo)> = {
+        // Collect note subscriptions for this account.
+        // 購読経路を持つ全 Notes 種別 (timeline / antenna / channel / role /
+        // user-list) を polling 対象にする。api_endpoint() を持たない種別は
+        // subscribe_notes で弾かれているため到達しない。
+        let subs_snapshot: Vec<(String, TimelineKey)> = {
             let subs = subscriptions.read().await;
             subs.iter()
-                .filter(|(_, info)| {
-                    info.account_id == account_id && info.kind == "timeline" && info.active
+                .filter(|(_, info)| info.account_id == account_id && info.active)
+                .filter_map(|(id, info)| match &info.target {
+                    SubscriptionTarget::Notes(key) if key.api_endpoint().is_some() => {
+                        Some((id.clone(), key.clone()))
+                    }
+                    _ => None,
                 })
-                .map(|(id, info)| (id.clone(), info.clone()))
                 .collect()
         };
 
         let mut poll_failed = false;
 
-        for (sub_id, info) in &subs_snapshot {
+        for (sub_id, key) in &subs_snapshot {
             let state = sub_states
                 .entry(sub_id.clone())
                 .or_insert(PollSubState { since_id: None });
 
-            let tl_type = TimelineType::new(&info.timeline_type);
-            let mut options = TimelineOptions::new(30, state.since_id.clone(), None);
-            options.list_id = info.params.as_ref().and_then(|p| {
-                p.get("listId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
+            let options = TimelineOptions::new(30, state.since_id.clone(), None);
 
             match api_client
-                .get_timeline(&host, &token, &account_id, tl_type, options)
+                .get_timeline(&host, &token, &account_id, key, options)
                 .await
             {
                 Ok(notes) if !notes.is_empty() => {
@@ -1792,9 +1780,11 @@ async fn polling_loop(
                         // Cache to DB
                         let db = db.clone();
                         let note_for_cache = Arc::clone(&note);
-                        let timeline_type = info.timeline_type.clone();
+                        let key = key.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(e) = db.cache_note(&note_for_cache, &timeline_type) {
+                            if let Err(e) =
+                                db.ingest_notes(std::slice::from_ref(note_for_cache.as_ref()), &key)
+                            {
                                 tracing::warn!(error = %e, "failed to cache polled note");
                             }
                         });
@@ -1804,7 +1794,11 @@ async fn polling_loop(
                             subscription_id: sub_id.clone(),
                             note,
                         };
-                        emit_both(emitter.as_ref(), &event_bus, StreamEvent::Note(Box::new(payload)));
+                        emit_both(
+                            emitter.as_ref(),
+                            &event_bus,
+                            StreamEvent::Note(Box::new(payload)),
+                        );
                     }
 
                     consecutive_failures = 0;
@@ -1913,9 +1907,9 @@ async fn polling_loop(
             };
 
             emitter.emit(StreamEvent::Status(Box::new(StreamStatusEvent {
-                    account_id: account_id.clone(),
-                    state: StreamConnectionState::Reconnecting,
-                })));
+                account_id: account_id.clone(),
+                state: StreamConnectionState::Reconnecting,
+            })));
 
             Duration::from_secs(backoff)
         } else {
@@ -2016,7 +2010,15 @@ mod tests {
 
         for text in [&added, &deleted, &unknown] {
             handle_ws_message(
-                &emitter, &event_bus, &db, &api, "acc-1", "h.example", "tok", text, &subs,
+                &emitter,
+                &event_bus,
+                &db,
+                &api,
+                "acc-1",
+                "h.example",
+                "tok",
+                text,
+                &subs,
             )
             .await;
         }
@@ -2058,11 +2060,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let manager = StreamingManager::new(
-            Arc::new(ChannelEmitter(tx)),
-            Arc::new(EventBus::new()),
-            db,
-        );
+        let manager =
+            StreamingManager::new(Arc::new(ChannelEmitter(tx)), Arc::new(EventBus::new()), db);
 
         // 127.0.0.1:1 は即 connection refused になる
         manager
@@ -2141,7 +2140,10 @@ mod tests {
         let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1"]).await;
         drain_status(&mut rx);
 
-        manager.connect("acc-1", "127.0.0.1:1", "token").await.unwrap();
+        manager
+            .connect("acc-1", "127.0.0.1:1", "token")
+            .await
+            .unwrap();
 
         // 接続タスクは 1 本のまま (張り直していない)
         assert_eq!(manager.connections.lock().await.len(), 1);
@@ -2163,7 +2165,7 @@ mod tests {
             StreamingManager::new(Arc::new(ChannelEmitter(tx)), Arc::new(EventBus::new()), db);
 
         let err = manager
-            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("home").unwrap(), None)
             .await
             .expect_err("接続していないアカウントの購読は通らない");
         assert_eq!(err.code(), "NO_CONNECTION");
@@ -2176,11 +2178,11 @@ mod tests {
         // cross-account (#777): 片方を切っても、もう片方の購読と capture は残る。
         let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1", "acc-2"]).await;
         let sub1 = manager
-            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("home").unwrap(), None)
             .await
             .unwrap();
         let sub2 = manager
-            .subscribe_timeline("acc-2", TimelineType::new("local"), None)
+            .subscribe_notes("acc-2", TimelineKey::parse("local").unwrap(), None)
             .await
             .unwrap();
         manager.sub_note("acc-1", "note-1").await.unwrap();
@@ -2208,7 +2210,7 @@ mod tests {
         // (捨てると再接続リプレイと再開で channel / params を復元できない)。
         let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
         let sub = manager
-            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("home").unwrap(), None)
             .await
             .unwrap();
 
@@ -2217,7 +2219,8 @@ mod tests {
             let subs = manager.subscriptions.read().await;
             let info = subs.get(&sub).expect("中断しても metadata は残る");
             assert!(!info.active);
-            assert_eq!(info.channel, "homeTimeline");
+            let (channel, _) = info.channel_and_params().unwrap();
+            assert_eq!(channel, "homeTimeline");
         }
         // 二重中断は no-op で成功する (UI 側で状態を持たなくてよい)
         manager.suspend_subscription("acc-1", &sub).await.unwrap();
@@ -2235,7 +2238,7 @@ mod tests {
         // 購読 ID を知っていても、持ち主でなければ触れない。
         let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1", "acc-2"]).await;
         let sub = manager
-            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("home").unwrap(), None)
             .await
             .unwrap();
 
@@ -2322,7 +2325,7 @@ mod tests {
         // カラムが空になる。
         let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1"]).await;
         let sub = manager
-            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("home").unwrap(), None)
             .await
             .unwrap();
         drain_status(&mut rx);
@@ -2345,7 +2348,7 @@ mod tests {
 
         // polling 中でも購読を足せる (WS コマンドではなく表に載るだけ)
         let sub2 = manager
-            .subscribe_timeline("acc-1", TimelineType::new("local"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("local").unwrap(), None)
             .await
             .unwrap();
         assert!(manager.subscriptions.read().await.contains_key(&sub2));
@@ -2366,7 +2369,7 @@ mod tests {
     async fn unsubscribe_drops_the_subscription_in_both_modes() {
         let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
         let sub = manager
-            .subscribe_timeline("acc-1", TimelineType::new("home"), None)
+            .subscribe_notes("acc-1", TimelineKey::parse("home").unwrap(), None)
             .await
             .unwrap();
 

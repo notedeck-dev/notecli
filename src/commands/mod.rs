@@ -41,6 +41,15 @@ pub async fn run_cli(
             let account = resolve_account(&db, Some(target))?;
             return auth::run_logout(&db, &account, fmt);
         }
+        Commands::Cache(cache_cmd) => {
+            return match cache_cmd {
+                crate::cli::CacheCommands::Sweep => {
+                    let deleted = db.sweep_orphan_notes()?;
+                    println!("Removed {deleted} orphan note(s) from cache");
+                    Ok(())
+                }
+            }
+        }
         _ => {}
     }
 
@@ -63,7 +72,15 @@ pub async fn run_cli(
             reply_to,
             local_only,
         } => {
-            notes::run_post(&ctx, text, cw.as_deref(), visibility, reply_to.as_deref(), *local_only).await
+            notes::run_post(
+                &ctx,
+                text,
+                cw.as_deref(),
+                visibility,
+                reply_to.as_deref(),
+                *local_only,
+            )
+            .await
         }
         Commands::Timeline { r#type, limit } => notes::run_timeline(&ctx, r#type, *limit).await,
         Commands::Search { query, limit } => notes::run_search(&ctx, query, *limit).await,
@@ -71,9 +88,7 @@ pub async fn run_cli(
         Commands::Replies { id, limit } => notes::run_replies(&ctx, id, *limit).await,
         Commands::Thread { id, limit } => notes::run_thread(&ctx, id, *limit).await,
         Commands::Delete { id } => notes::run_delete(&ctx, id).await,
-        Commands::Update { id, text, cw } => {
-            notes::run_update(&ctx, id, text, cw.as_deref()).await
-        }
+        Commands::Update { id, text, cw } => notes::run_update(&ctx, id, text, cw.as_deref()).await,
         Commands::React { note_id, reaction } => notes::run_react(&ctx, note_id, reaction).await,
         Commands::Unreact { note_id } => notes::run_unreact(&ctx, note_id).await,
         Commands::Renote { note_id } => notes::run_renote(&ctx, note_id).await,
@@ -93,7 +108,8 @@ pub async fn run_cli(
         | Commands::Doctor
         | Commands::Daemon { .. }
         | Commands::Login { .. }
-        | Commands::Logout { .. } => {
+        | Commands::Logout { .. }
+        | Commands::Cache(..) => {
             unreachable!()
         }
     }
