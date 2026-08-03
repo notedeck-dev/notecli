@@ -6,13 +6,13 @@ use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::error::NoteDeckError;
+use crate::error::{AuthErrorKind, NoteDeckError};
 use crate::models::{
-    Antenna, AuthResult, Channel, ChatMessage, ChatUser, Clip, CreateNoteParams,
+    Antenna, AuthResult, Channel, ChatMessage, ChatUser, Clip, CreateNoteParams, MutedWordsResult,
     NormalizedDriveFile, NormalizedNote, NormalizedNoteReaction, NormalizedNotification,
-    MutedWordsResult, NormalizedUser, NormalizedUserDetail, RawCreateNoteResponse, RawDriveFile,
-    RawEmojisResponse, RawMiAuthResponse, RawNote, RawNoteReaction, RawNotification, RawUser,
-    RawUserDetail, SearchOptions, ServerEmoji, TimelineOptions, TimelineType, UserList,
+    NormalizedUser, NormalizedUserDetail, RawCreateNoteResponse, RawDriveFile, RawEmojisResponse,
+    RawMiAuthResponse, RawNote, RawNoteReaction, RawNotification, RawUser, RawUserDetail,
+    SearchOptions, ServerEmoji, TimelineKey, TimelineOptions, UserList,
 };
 
 /// Maximum response body size (50 MB) to prevent memory exhaustion from malicious servers.
@@ -37,6 +37,23 @@ fn apply_pagination(params: &mut Value, since_id: Option<&str>, until_id: Option
     if let Some(id) = until_id {
         params["untilId"] = json!(id);
     }
+}
+
+/// Misskey ID (aid / aidx) の時刻部の基準時刻 (2000-01-01T00:00:00Z)。
+const TIME2000_MS: i64 = 946_684_800_000;
+
+/// epoch ミリ秒を Misskey ID の時刻部 (base36 8 桁) に変換する。
+///
+/// サーバーは sinceId/untilId を `idService.parse()` で createdAt に戻して
+/// 比較するため、時刻部だけの ID でも日付フィルタとして機能する。
+fn misskey_id_at(ms: i64) -> String {
+    let mut n = (ms - TIME2000_MS).max(0) as u64;
+    let mut s = String::new();
+    while n > 0 {
+        s.insert(0, char::from_digit((n % 36) as u32, 36).unwrap());
+        n /= 36;
+    }
+    format!("{s:0>8}")
 }
 
 pub struct MisskeyClient {
@@ -90,6 +107,7 @@ impl MisskeyClient {
                 return Err(NoteDeckError::Api {
                     endpoint: endpoint.to_string(),
                     status: 0,
+                    api_code: None,
                     message: "Response too large".to_string(),
                 });
             }
@@ -104,6 +122,7 @@ impl MisskeyClient {
                 return Err(NoteDeckError::Api {
                     endpoint: endpoint.to_string(),
                     status: 0,
+                    api_code: None,
                     message: "Response too large".to_string(),
                 });
             }
@@ -111,6 +130,7 @@ impl MisskeyClient {
         String::from_utf8(buf).map_err(|_| NoteDeckError::Api {
             endpoint: endpoint.to_string(),
             status: 0,
+            api_code: None,
             message: "Invalid UTF-8 in response".to_string(),
         })
     }
@@ -160,6 +180,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: endpoint.to_string(),
                 status,
+                api_code,
                 message,
             });
         }
@@ -172,16 +193,28 @@ impl MisskeyClient {
         }
     }
 
+    /// タイムラインを取得する。endpoint と追加パラメータ (listId 等) は `key` から
+    /// 導出する (`TimelineOptions.list_id` は境界アダプタ入力であり本 API は読まない)。
+    /// 専用 API を持つ種別 (Favorites / Clip — `api_endpoint() == None`) は Err。
     pub async fn get_timeline(
         &self,
         host: &str,
         token: &str,
         account_id: &str,
-        timeline_type: TimelineType,
+        key: &TimelineKey,
         options: TimelineOptions,
     ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
-        let endpoint = timeline_type.api_endpoint();
+        let (endpoint, key_params) = key.api_endpoint().ok_or_else(|| {
+            NoteDeckError::InvalidInput(format!(
+                "timeline key '{key}' has no generic timeline endpoint"
+            ))
+        })?;
         let mut params = json!({ "limit": options.limit() });
+        if let Value::Object(extra) = key_params {
+            for (k, v) in extra {
+                params[k] = v;
+            }
+        }
         apply_pagination(
             &mut params,
             options.since_id.as_deref(),
@@ -206,9 +239,6 @@ impl MisskeyClient {
                 params["withSensitive"] = json!(v);
                 params["excludeNsfw"] = json!(!v);
             }
-        }
-        if let Some(ref id) = options.list_id {
-            params["listId"] = json!(id);
         }
 
         let data = self.request(host, token, &endpoint, params).await?;
@@ -251,7 +281,12 @@ impl MisskeyClient {
         antenna_id: &str,
     ) -> Result<Antenna, NoteDeckError> {
         let data = self
-            .request(host, token, "antennas/show", json!({ "antennaId": antenna_id }))
+            .request(
+                host,
+                token,
+                "antennas/show",
+                json!({ "antennaId": antenna_id }),
+            )
             .await?;
         let antenna: Antenna = serde_json::from_value(data)?;
         Ok(antenna)
@@ -667,6 +702,7 @@ impl MisskeyClient {
             .map_err(|e| NoteDeckError::Api {
                 endpoint: "drive/files/create".to_string(),
                 status: 0,
+                api_code: None,
                 message: e.to_string(),
             })?;
 
@@ -689,6 +725,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "drive/files/create".to_string(),
                 status,
+                api_code: None,
                 message,
             });
         }
@@ -869,6 +906,44 @@ impl MisskeyClient {
             .collect())
     }
 
+    /// はなみすきー (hanamisskey/misskey) 独自のノート検索。
+    ///
+    /// 本家 `notes/search` はロールポリシー `canSearchNotes` で無効化されており、
+    /// 代わりに `notes/hanamisearch-v1` が開放されている。このエンドポイントは
+    /// sinceDate/untilDate を受け付けないため、日付は ID の時刻部に変換して渡す。
+    /// ページング用の sinceId/untilId が明示されていればそちらを優先する
+    /// (untilId で遡る 2 ページ目以降は日付の上限より必ず古いため)。
+    pub async fn search_notes_hanami(
+        &self,
+        host: &str,
+        token: &str,
+        account_id: &str,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
+        let mut params = json!({ "query": query, "limit": options.limit() });
+        let since_id = options
+            .since_id
+            .clone()
+            .or_else(|| options.since_date.map(misskey_id_at));
+        let until_id = options
+            .until_id
+            .clone()
+            .or_else(|| options.until_date.map(misskey_id_at));
+        apply_pagination(&mut params, since_id.as_deref(), until_id.as_deref());
+        if let Some(ref uid) = options.user_id {
+            params["userId"] = json!(uid);
+        }
+        let data = self
+            .request(host, token, "notes/hanamisearch-v1", params)
+            .await?;
+        let raw: Vec<RawNote> = serde_json::from_value(data)?;
+        Ok(raw
+            .into_iter()
+            .map(|n| n.normalize(account_id, host))
+            .collect())
+    }
+
     pub async fn get_notifications(
         &self,
         host: &str,
@@ -928,26 +1003,23 @@ impl MisskeyClient {
             .await?;
 
         if !res.status().is_success() {
-            return Err(NoteDeckError::Auth(format!(
-                "MiAuth check failed: {}",
-                res.status().as_u16()
+            return Err(NoteDeckError::Auth(AuthErrorKind::MiAuthFailed(
+                res.status().as_u16(),
             )));
         }
 
         let text = Self::read_body_limited(res, "miauth/check").await?;
         let data: RawMiAuthResponse = serde_json::from_str(&text)?;
         if !data.ok {
-            return Err(NoteDeckError::Auth(
-                "MiAuth authentication was not completed".to_string(),
-            ));
+            return Err(NoteDeckError::Auth(AuthErrorKind::MiAuthPending));
         }
 
         let token = data
             .token
-            .ok_or_else(|| NoteDeckError::Auth("MiAuth response missing token".to_string()))?;
+            .ok_or(NoteDeckError::Auth(AuthErrorKind::MiAuthMalformed("token")))?;
         let user = data
             .user
-            .ok_or_else(|| NoteDeckError::Auth("MiAuth response missing user".to_string()))?;
+            .ok_or(NoteDeckError::Auth(AuthErrorKind::MiAuthMalformed("user")))?;
 
         Ok(AuthResult {
             token,
@@ -1338,6 +1410,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "endpoint".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch endpoint info".to_string(),
             });
         }
@@ -1383,6 +1456,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "endpoints".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch endpoints".to_string(),
             });
         }
@@ -2155,6 +2229,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: ".well-known/nodeinfo".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch well-known nodeinfo".to_string(),
             });
         }
@@ -2176,6 +2251,7 @@ impl MisskeyClient {
             .ok_or_else(|| NoteDeckError::Api {
                 endpoint: ".well-known/nodeinfo".to_string(),
                 status: 0,
+                api_code: None,
                 message: format!("No nodeinfo URL found for {host}"),
             })?;
 
@@ -2185,6 +2261,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: ".well-known/nodeinfo".to_string(),
                 status: 0,
+                api_code: None,
                 message: format!("Nodeinfo URL host/scheme mismatch for {host}"),
             });
         }
@@ -2199,6 +2276,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "nodeinfo".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch nodeinfo".to_string(),
             });
         }
@@ -2580,6 +2658,7 @@ impl MisskeyClient {
             return Err(NoteDeckError::Api {
                 endpoint: "meta".to_string(),
                 status: res.status().as_u16(),
+                api_code: None,
                 message: "Failed to fetch server meta".to_string(),
             });
         }
@@ -2741,7 +2820,7 @@ mod tests {
                 "h",
                 "token",
                 "acc1",
-                TimelineType::new("home"),
+                &TimelineKey::parse("home").unwrap(),
                 TimelineOptions::default(),
             )
             .await
@@ -2901,7 +2980,10 @@ mod tests {
         let role = notifs[0].role.as_ref().expect("role present");
         assert_eq!(role.name, "Active");
         assert_eq!(role.color.as_deref(), Some("#ff0000"));
-        assert_eq!(role.icon_url.as_deref(), Some("https://example.com/role.png"));
+        assert_eq!(
+            role.icon_url.as_deref(),
+            Some("https://example.com/role.png")
+        );
     }
 
     #[tokio::test]
@@ -2923,6 +3005,60 @@ mod tests {
             .unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].text.as_deref(), Some("Rust is great"));
+    }
+
+    #[test]
+    fn misskey_id_at_encodes_time_part() {
+        // misskey.flowers の実 ID apfldnaym0v100e3 (createdAt 2026-08-02T16:41:40.666Z)
+        assert_eq!(misskey_id_at(1_785_688_900_666), "apfldnay");
+        assert_eq!(misskey_id_at(TIME2000_MS), "00000000");
+        // 2000 年より前は下限に丸める
+        assert_eq!(misskey_id_at(0), "00000000");
+    }
+
+    #[tokio::test]
+    async fn search_notes_hanami_uses_hanamisearch_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/hanamisearch-v1"))
+            .and(body_partial_json(
+                json!({ "query": "rust", "sinceId": "apfldnay", "untilId": "apfldnay" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([raw_note_json("n1", "rust note")])),
+            )
+            .mount(&server)
+            .await;
+
+        let mut options = SearchOptions::default();
+        options.since_date = Some(1_785_688_900_666);
+        options.until_date = Some(1_785_688_900_666);
+        let client = MisskeyClient::with_base_url(&server.uri());
+        let notes = client
+            .search_notes_hanami("h", "token", "acc1", "rust", options)
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_notes_hanami_prefers_explicit_pagination_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/hanamisearch-v1"))
+            .and(body_partial_json(json!({ "untilId": "n42" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let mut options = SearchOptions::default();
+        options.until_id = Some("n42".to_string());
+        options.until_date = Some(1_785_688_900_666);
+        let client = MisskeyClient::with_base_url(&server.uri());
+        client
+            .search_notes_hanami("h", "token", "acc1", "rust", options)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3596,7 +3732,9 @@ mod tests {
         // withReplies のみ指定 → notify は body に含まれないこと
         Mock::given(method("POST"))
             .and(path("/api/following/update"))
-            .and(body_partial_json(json!({ "userId": "u1", "withReplies": false })))
+            .and(body_partial_json(
+                json!({ "userId": "u1", "withReplies": false }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&server)
             .await;
@@ -3613,7 +3751,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/users/update-memo"))
-            .and(body_partial_json(json!({ "userId": "u1", "memo": "friend" })))
+            .and(body_partial_json(
+                json!({ "userId": "u1", "memo": "friend" }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&server)
             .await;
@@ -3700,10 +3840,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/notes/search"))
-            .and(body_partial_json(json!({ "query": "rust", "userId": "u1" })))
+            .and(body_partial_json(
+                json!({ "query": "rust", "userId": "u1" }),
+            ))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!([raw_note_json("n1", "rust note")])),
+                ResponseTemplate::new(200).set_body_json(json!([raw_note_json("n1", "rust note")])),
             )
             .mount(&server)
             .await;

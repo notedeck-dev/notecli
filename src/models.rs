@@ -447,38 +447,252 @@ pub struct CreateNotePoll {
     pub expires_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
-#[serde(transparent)]
-pub struct TimelineType(String);
+/// タイムライン所属キーの正本。
+///
+/// canonical 文字列形式（DB の `timeline_key` 列・TS 境界の `string` はこの形式）:
+///
+/// | variant | canonical |
+/// |---|---|
+/// | `Basic` | `home` / `local` / `social` / `global` / `bubble` 等（`:` を含まない非予約語） |
+/// | `UserList` | `user-list:{listId}` |
+/// | `Antenna` | `antenna:{antennaId}` |
+/// | `Channel` | `channel:{channelId}` |
+/// | `Role` | `role:{roleId}` |
+/// | `Clip` | `clip:{clipId}` |
+/// | `UserNotes` | `user:{userId}` |
+/// | `Mentions` | `mentions` |
+/// | `Specified` | `specified` |
+/// | `Favorites` | `favorites` |
+///
+/// `explore` は DeckExploreColumn の読み出し専用キー（`Basic` として parse は通るが
+/// 書込経路なし・常に空読み）。
+///
+/// prefix と bare 語は小文字で定義する。id 部は不透明バイト列として入力どおり保持し、
+/// 大小文字の正規化・検証を行わない（ULID 形式の id は大文字を含む）。
+/// 構築は `parse` か境界アダプタ経由に限る。`Basic` へ予約語・`:`・空文字列を直接
+/// 渡してはならない（canonical 衝突 / parse 不能を生む）。
+/// Tauri コマンドの invoke 引数型には使わない（String 受け → parse を維持）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TimelineKey {
+    Basic(String),
+    UserList { list_id: String },
+    Antenna { antenna_id: String },
+    Channel { channel_id: String },
+    Role { role_id: String },
+    Clip { clip_id: String },
+    UserNotes { user_id: String },
+    Mentions,
+    Specified,
+    Favorites,
+}
 
-impl TimelineType {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+/// bare 単独で現れたら parse エラーになる prefix 予約語
+const RESERVED_PREFIXES: [&str; 6] = ["user-list", "antenna", "channel", "role", "clip", "user"];
+
+/// kebab-case を lowerCamelCase に変換（"vmimi-relay" → "vmimiRelay"）。
+/// Misskey の WS チャンネル名は lowerCamel、endpoint は kebab が慣行。
+fn kebab_to_lower_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, seg) in s.split('-').enumerate() {
+        if i == 0 {
+            out.push_str(seg);
+        } else {
+            let mut chars = seg.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                out.push_str(chars.as_str());
+            }
+        }
     }
+    out
+}
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn api_endpoint(&self) -> String {
-        match self.0.as_str() {
-            "home" => "notes/timeline".to_string(),
-            "local" => "notes/local-timeline".to_string(),
-            "social" => "notes/hybrid-timeline".to_string(),
-            "global" => "notes/global-timeline".to_string(),
-            other => format!("notes/{other}-timeline"),
+impl TimelineKey {
+    /// canonical 文字列から構築する。分割は最初の `:` による splitn(2)（id 内に `:` が
+    /// 残る場合も id の一部として保持）。
+    pub fn parse(s: &str) -> Result<Self, crate::error::NoteDeckError> {
+        use crate::error::NoteDeckError;
+        if s.is_empty() {
+            return Err(NoteDeckError::InvalidInput(
+                "timeline key must not be empty".to_string(),
+            ));
+        }
+        if s.len() > 256 {
+            return Err(NoteDeckError::InvalidInput(
+                "timeline key exceeds 256 bytes".to_string(),
+            ));
+        }
+        if s.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return Err(NoteDeckError::InvalidInput(
+                "timeline key contains control characters".to_string(),
+            ));
+        }
+        if let Some((prefix, id)) = s.split_once(':') {
+            if id.is_empty() {
+                return Err(NoteDeckError::InvalidInput(format!(
+                    "timeline key '{prefix}:' has empty id"
+                )));
+            }
+            let id = id.to_string();
+            match prefix {
+                "user-list" => Ok(Self::UserList { list_id: id }),
+                "antenna" => Ok(Self::Antenna { antenna_id: id }),
+                "channel" => Ok(Self::Channel { channel_id: id }),
+                "role" => Ok(Self::Role { role_id: id }),
+                "clip" => Ok(Self::Clip { clip_id: id }),
+                "user" => Ok(Self::UserNotes { user_id: id }),
+                _ => Err(NoteDeckError::InvalidInput(format!(
+                    "unknown timeline key prefix '{prefix}'"
+                ))),
+            }
+        } else {
+            match s {
+                "mentions" => Ok(Self::Mentions),
+                "specified" => Ok(Self::Specified),
+                "favorites" => Ok(Self::Favorites),
+                _ if RESERVED_PREFIXES.contains(&s) => Err(NoteDeckError::InvalidInput(format!(
+                    "bare reserved timeline key '{s}' (id required)"
+                ))),
+                _ => Ok(Self::Basic(s.to_string())),
+            }
         }
     }
 
-    pub fn ws_channel(&self) -> String {
-        match self.0.as_str() {
-            "home" => "homeTimeline".to_string(),
-            "local" => "localTimeline".to_string(),
-            "social" => "hybridTimeline".to_string(),
-            "global" => "globalTimeline".to_string(),
-            other => format!("{other}Timeline"),
+    pub fn as_canonical(&self) -> String {
+        match self {
+            Self::Basic(t) => t.clone(),
+            Self::UserList { list_id } => format!("user-list:{list_id}"),
+            Self::Antenna { antenna_id } => format!("antenna:{antenna_id}"),
+            Self::Channel { channel_id } => format!("channel:{channel_id}"),
+            Self::Role { role_id } => format!("role:{role_id}"),
+            Self::Clip { clip_id } => format!("clip:{clip_id}"),
+            Self::UserNotes { user_id } => format!("user:{user_id}"),
+            Self::Mentions => "mentions".to_string(),
+            Self::Specified => "specified".to_string(),
+            Self::Favorites => "favorites".to_string(),
         }
+    }
+
+    /// REST エンドポイントと追加パラメータ。Favorites / Clip は応答形状・API 方針の
+    /// 都合で専用 API を維持するため None。
+    pub fn api_endpoint(&self) -> Option<(std::borrow::Cow<'static, str>, Value)> {
+        use std::borrow::Cow;
+        match self {
+            Self::Basic(t) => Some(match t.as_str() {
+                "home" => (Cow::Borrowed("notes/timeline"), serde_json::json!({})),
+                "local" => (Cow::Borrowed("notes/local-timeline"), serde_json::json!({})),
+                "social" => (
+                    Cow::Borrowed("notes/hybrid-timeline"),
+                    serde_json::json!({}),
+                ),
+                "global" => (
+                    Cow::Borrowed("notes/global-timeline"),
+                    serde_json::json!({}),
+                ),
+                other => (
+                    Cow::Owned(format!("notes/{other}-timeline")),
+                    serde_json::json!({}),
+                ),
+            }),
+            Self::UserList { list_id } => Some((
+                Cow::Borrowed("notes/user-list-timeline"),
+                serde_json::json!({ "listId": list_id }),
+            )),
+            Self::Antenna { antenna_id } => Some((
+                Cow::Borrowed("antennas/notes"),
+                serde_json::json!({ "antennaId": antenna_id }),
+            )),
+            Self::Channel { channel_id } => Some((
+                Cow::Borrowed("channels/timeline"),
+                serde_json::json!({ "channelId": channel_id }),
+            )),
+            Self::Role { role_id } => Some((
+                Cow::Borrowed("roles/notes"),
+                serde_json::json!({ "roleId": role_id }),
+            )),
+            Self::UserNotes { user_id } => Some((
+                Cow::Borrowed("users/notes"),
+                serde_json::json!({ "userId": user_id }),
+            )),
+            Self::Mentions => Some((Cow::Borrowed("notes/mentions"), serde_json::json!({}))),
+            Self::Specified => Some((
+                Cow::Borrowed("notes/mentions"),
+                serde_json::json!({ "visibility": "specified" }),
+            )),
+            Self::Favorites | Self::Clip { .. } => None,
+        }
+    }
+
+    /// WS チャンネル名とパラメータ。streaming 購読を持たない種別は None。
+    /// 未知 Basic の fallback は kebab→lowerCamel 変換付き
+    /// （"vmimi-relay" → "vmimiRelayTimeline"）。
+    pub fn ws_channel(&self) -> Option<(std::borrow::Cow<'static, str>, Option<Value>)> {
+        use std::borrow::Cow;
+        match self {
+            Self::Basic(t) => Some(match t.as_str() {
+                "home" => (Cow::Borrowed("homeTimeline"), None),
+                "local" => (Cow::Borrowed("localTimeline"), None),
+                "social" => (Cow::Borrowed("hybridTimeline"), None),
+                "global" => (Cow::Borrowed("globalTimeline"), None),
+                other => (
+                    Cow::Owned(format!("{}Timeline", kebab_to_lower_camel(other))),
+                    None,
+                ),
+            }),
+            Self::UserList { list_id } => Some((
+                Cow::Borrowed("userList"),
+                Some(serde_json::json!({ "listId": list_id })),
+            )),
+            Self::Antenna { antenna_id } => Some((
+                Cow::Borrowed("antenna"),
+                Some(serde_json::json!({ "antennaId": antenna_id })),
+            )),
+            Self::Channel { channel_id } => Some((
+                Cow::Borrowed("channel"),
+                Some(serde_json::json!({ "channelId": channel_id })),
+            )),
+            Self::Role { role_id } => Some((
+                Cow::Borrowed("roleTimeline"),
+                Some(serde_json::json!({ "roleId": role_id })),
+            )),
+            Self::UserNotes { .. }
+            | Self::Mentions
+            | Self::Specified
+            | Self::Favorites
+            | Self::Clip { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TimelineKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_canonical())
+    }
+}
+
+impl Serialize for TimelineKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_canonical())
+    }
+}
+
+impl<'de> Deserialize<'de> for TimelineKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+// derive(specta::Type) は serde 属性しか読まず手書き Serialize を無視して
+// tagged union を TS に生成するため、String へ委譲する手書き impl を使う
+// （前例: error.rs の NoteDeckError）。TS 上は常に string に inline される。
+#[cfg(feature = "specta")]
+impl specta::Type for TimelineKey {
+    fn inline(
+        type_map: &mut specta::TypeCollection,
+        generics: specta::Generics,
+    ) -> specta::datatype::DataType {
+        String::inline(type_map, generics)
     }
 }
 
@@ -1783,59 +1997,209 @@ mod tests {
         ));
     }
 
-    // ---- TimelineType ----
+    // ---- TimelineKey ----
 
     #[test]
-    fn timeline_type_api_endpoint_known() {
-        assert_eq!(TimelineType::new("home").api_endpoint(), "notes/timeline");
+    fn timeline_key_parse_canonical_roundtrip() {
+        // parse が生成した値に対して parse(as_canonical(k)) == k が成立する
+        let cases = [
+            "home",
+            "local",
+            "social",
+            "global",
+            "bubble",
+            "explore",
+            "user-list:abc123",
+            "antenna:01H8XGJWBWBAAMV5ZRWPS2N4EY", // ULID 大文字 id はそのまま保持
+            "channel:xyz",
+            "role:r1",
+            "clip:c1",
+            "user:u1",
+            "mentions",
+            "specified",
+            "favorites",
+        ];
+        for s in cases {
+            let key = TimelineKey::parse(s).unwrap();
+            assert_eq!(key.as_canonical(), s, "canonical mismatch for {s}");
+            assert_eq!(TimelineKey::parse(&key.as_canonical()).unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn timeline_key_parse_err_conditions() {
+        // 空 / 未知 prefix / 空 id / bare 予約語 / 256B 超 / 制御文字
+        for s in [
+            "",
+            "xxx:yyy",
+            "antenna:",
+            "user-list",
+            "antenna",
+            "channel",
+            "role",
+            "clip",
+            "user",
+            ":",
+            ":b",
+            &"a".repeat(257),
+            "home\n",
+            "antenna:\x01abc",
+        ] {
+            assert!(TimelineKey::parse(s).is_err(), "expected Err for {s:?}");
+        }
+    }
+
+    #[test]
+    fn timeline_key_splitn_keeps_colon_in_id() {
+        // 最初の ':' で分割し、id 内の ':' は保持する
+        let key = TimelineKey::parse("antenna:a:b").unwrap();
         assert_eq!(
-            TimelineType::new("local").api_endpoint(),
-            "notes/local-timeline"
+            key,
+            TimelineKey::Antenna {
+                antenna_id: "a:b".to_string()
+            }
+        );
+        assert_eq!(key.as_canonical(), "antenna:a:b");
+    }
+
+    #[test]
+    fn timeline_key_api_endpoint_table() {
+        let ep = |s: &str| {
+            let (e, p) = TimelineKey::parse(s).unwrap().api_endpoint().unwrap();
+            (e.to_string(), p)
+        };
+        assert_eq!(ep("home"), ("notes/timeline".into(), serde_json::json!({})));
+        assert_eq!(
+            ep("local"),
+            ("notes/local-timeline".into(), serde_json::json!({}))
         );
         assert_eq!(
-            TimelineType::new("social").api_endpoint(),
-            "notes/hybrid-timeline"
+            ep("social"),
+            ("notes/hybrid-timeline".into(), serde_json::json!({}))
         );
         assert_eq!(
-            TimelineType::new("global").api_endpoint(),
-            "notes/global-timeline"
+            ep("global"),
+            ("notes/global-timeline".into(), serde_json::json!({}))
         );
-    }
-
-    #[test]
-    fn timeline_type_api_endpoint_unknown_fallback() {
         assert_eq!(
-            TimelineType::new("bubble").api_endpoint(),
-            "notes/bubble-timeline"
+            ep("bubble"),
+            ("notes/bubble-timeline".into(), serde_json::json!({}))
         );
+        assert_eq!(
+            ep("user-list:l1"),
+            (
+                "notes/user-list-timeline".into(),
+                serde_json::json!({ "listId": "l1" })
+            )
+        );
+        assert_eq!(
+            ep("antenna:a1"),
+            (
+                "antennas/notes".into(),
+                serde_json::json!({ "antennaId": "a1" })
+            )
+        );
+        assert_eq!(
+            ep("channel:c1"),
+            (
+                "channels/timeline".into(),
+                serde_json::json!({ "channelId": "c1" })
+            )
+        );
+        assert_eq!(
+            ep("role:r1"),
+            ("roles/notes".into(), serde_json::json!({ "roleId": "r1" }))
+        );
+        assert_eq!(
+            ep("user:u1"),
+            ("users/notes".into(), serde_json::json!({ "userId": "u1" }))
+        );
+        assert_eq!(
+            ep("mentions"),
+            ("notes/mentions".into(), serde_json::json!({}))
+        );
+        assert_eq!(
+            ep("specified"),
+            (
+                "notes/mentions".into(),
+                serde_json::json!({ "visibility": "specified" })
+            )
+        );
+        assert!(TimelineKey::Favorites.api_endpoint().is_none());
+        assert!(TimelineKey::parse("clip:c1")
+            .unwrap()
+            .api_endpoint()
+            .is_none());
     }
 
     #[test]
-    fn timeline_type_ws_channel_known() {
-        assert_eq!(TimelineType::new("home").ws_channel(), "homeTimeline");
-        assert_eq!(TimelineType::new("local").ws_channel(), "localTimeline");
-        assert_eq!(TimelineType::new("social").ws_channel(), "hybridTimeline");
-        assert_eq!(TimelineType::new("global").ws_channel(), "globalTimeline");
+    fn timeline_key_ws_channel_table() {
+        let ws = |s: &str| {
+            let (c, p) = TimelineKey::parse(s).unwrap().ws_channel().unwrap();
+            (c.to_string(), p)
+        };
+        assert_eq!(ws("home"), ("homeTimeline".into(), None));
+        assert_eq!(ws("local"), ("localTimeline".into(), None));
+        assert_eq!(ws("social"), ("hybridTimeline".into(), None));
+        assert_eq!(ws("global"), ("globalTimeline".into(), None));
+        // userList: 現行の user-listTimeline 誤生成バグの解消点
+        assert_eq!(
+            ws("user-list:l1"),
+            (
+                "userList".into(),
+                Some(serde_json::json!({ "listId": "l1" }))
+            )
+        );
+        assert_eq!(
+            ws("antenna:a1"),
+            (
+                "antenna".into(),
+                Some(serde_json::json!({ "antennaId": "a1" }))
+            )
+        );
+        assert_eq!(
+            ws("channel:c1"),
+            (
+                "channel".into(),
+                Some(serde_json::json!({ "channelId": "c1" }))
+            )
+        );
+        assert_eq!(
+            ws("role:r1"),
+            (
+                "roleTimeline".into(),
+                Some(serde_json::json!({ "roleId": "r1" }))
+            )
+        );
+        // kebab→lowerCamel fallback（VRTL 実例）。単語 1 語は挙動不変
+        assert_eq!(ws("vmimi-relay"), ("vmimiRelayTimeline".into(), None));
+        assert_eq!(ws("bubble"), ("bubbleTimeline".into(), None));
+        // 購読を持たない種別は None
+        for s in ["user:u1", "mentions", "specified", "favorites", "clip:c1"] {
+            assert!(TimelineKey::parse(s).unwrap().ws_channel().is_none());
+        }
     }
 
     #[test]
-    fn timeline_type_ws_channel_unknown_fallback() {
-        assert_eq!(TimelineType::new("bubble").ws_channel(), "bubbleTimeline");
+    fn timeline_key_serde_is_canonical_string() {
+        let key = TimelineKey::parse("user-list:l1").unwrap();
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, "\"user-list:l1\"");
+        let back: TimelineKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, key);
+        // Deserialize は parse に委譲し不正キーを弾く
+        assert!(serde_json::from_str::<TimelineKey>("\"user-list\"").is_err());
     }
 
+    #[cfg(feature = "specta")]
     #[test]
-    fn timeline_type_as_str() {
-        let tt = TimelineType::new("home");
-        assert_eq!(tt.as_str(), "home");
-    }
-
-    #[test]
-    fn timeline_type_serde_roundtrip() {
-        let tt = TimelineType::new("local");
-        let json = serde_json::to_string(&tt).unwrap();
-        assert_eq!(json, "\"local\"");
-        let back: TimelineType = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.as_str(), "local");
+    fn timeline_key_specta_inlines_to_string() {
+        // TS へは常に string として inline される（tagged union にならない）
+        let mut type_map = specta::TypeCollection::default();
+        let dt = <TimelineKey as specta::Type>::inline(&mut type_map, specta::Generics::Definition);
+        let string_dt =
+            <String as specta::Type>::inline(&mut type_map, specta::Generics::Definition);
+        assert_eq!(format!("{dt:?}"), format!("{string_dt:?}"));
     }
 
     // ---- TimelineOptions ----

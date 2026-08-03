@@ -9,12 +9,12 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use subtle::ConstantTimeEq;
 use futures_util::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
@@ -26,7 +26,7 @@ use crate::db::Database;
 use crate::event_bus::EventBus;
 use crate::models::{
     AccountPublic, CreateNoteParams, NormalizedNote, NormalizedNoteReaction,
-    NormalizedNotification, NormalizedUserDetail, TimelineType,
+    NormalizedNotification, NormalizedUserDetail, TimelineKey,
 };
 
 pub const DEFAULT_PORT: u16 = 19820;
@@ -143,8 +143,15 @@ impl ApiError {
 impl From<crate::error::NoteDeckError> for ApiError {
     fn from(e: crate::error::NoteDeckError) -> Self {
         let code = e.code().to_string();
+        let status = match &e {
+            // クライアント入力起因 (不正なタイムラインキー等) は 400。
+            // InvalidInput の Display はキー文字列等の入力のみでトークンを含まない
+            // ため e.to_string() のままでよい。
+            crate::error::NoteDeckError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             code,
             message: e.to_string(),
         }
@@ -239,7 +246,11 @@ fn core_openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_note, delete_note))
         .routes(routes!(get_note_children))
         .routes(routes!(get_note_conversation))
-        .routes(routes!(get_note_reactions, create_reaction, delete_reaction))
+        .routes(routes!(
+            get_note_reactions,
+            create_reaction,
+            delete_reaction
+        ))
         .routes(routes!(get_user))
         .routes(routes!(get_user_notes))
         .routes(routes!(search_notes))
@@ -254,7 +265,10 @@ fn core_openapi_router() -> OpenApiRouter<AppState> {
 /// own spec.
 pub fn build_core_routes(state: AppState) -> OpenApiRouter {
     core_openapi_router()
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -293,8 +307,14 @@ pub fn endpoints_from_spec(openapi: &utoipa::openapi::OpenApi) -> Vec<Value> {
         }
     }
     out.sort_by(|a, b| {
-        let ka = (a["path"].as_str().unwrap_or(""), a["method"].as_str().unwrap_or(""));
-        let kb = (b["path"].as_str().unwrap_or(""), b["method"].as_str().unwrap_or(""));
+        let ka = (
+            a["path"].as_str().unwrap_or(""),
+            a["method"].as_str().unwrap_or(""),
+        );
+        let kb = (
+            b["path"].as_str().unwrap_or(""),
+            b["method"].as_str().unwrap_or(""),
+        );
         ka.cmp(&kb)
     });
     out
@@ -365,11 +385,12 @@ async fn list_accounts(
     security(("bearer_auth" = [])),
     params(
         ("host" = String, Path, description = "Account host (e.g. misskey.io)"),
-        ("tl_type" = String, Path, description = "Timeline type: home | local | social | global"),
+        ("tl_type" = String, Path, description = "Timeline type: home | local | social | global (or fork-specific basic timelines like bubble)"),
         TimelineQueryParams,
     ),
     responses(
         (status = 200, description = "Timeline notes", body = Vec<NormalizedNote>),
+        (status = 400, description = "Invalid or non-basic timeline key", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "No account for host", body = ApiErrorResponse),
     )
@@ -382,10 +403,17 @@ async fn get_timeline(
     let account_id = state.account_id_for_host(&host)?;
     let (h, token) = crate::get_credentials(&state.db, &account_id)?;
     let options = opts.into_timeline_options();
-    let tl = TimelineType::new(tl_type);
+    // allowlist: daemon の公開面は Basic タイムラインのみ。パラメータ付きキー
+    // (antenna: 等) を受理すると実効 API 面が黙って拡大するため 400 で明示拒否する。
+    let key = TimelineKey::parse(&tl_type)?;
+    if !matches!(key, TimelineKey::Basic(_)) {
+        return Err(ApiError::from(crate::error::NoteDeckError::InvalidInput(
+            format!("only basic timelines are exposed here (got '{key}')"),
+        )));
+    }
     let notes = state
         .client
-        .get_timeline(&h, &token, &account_id, tl, options)
+        .get_timeline(&h, &token, &account_id, &key, options)
         .await?;
     Ok(Json(notes))
 }
@@ -622,7 +650,14 @@ async fn get_note_reactions(
     let limit = opts.limit.unwrap_or(20);
     let reactions = state
         .client
-        .get_note_reactions(&h, &token, &note_id, opts.r#type.as_deref(), limit, opts.until_id.as_deref())
+        .get_note_reactions(
+            &h,
+            &token,
+            &note_id,
+            opts.r#type.as_deref(),
+            limit,
+            opts.until_id.as_deref(),
+        )
         .await?;
     Ok(Json(reactions))
 }
@@ -674,10 +709,7 @@ async fn delete_reaction(
 ) -> Result<StatusCode, ApiError> {
     let account_id = state.account_id_for_host(&host)?;
     let (h, token) = crate::get_credentials(&state.db, &account_id)?;
-    state
-        .client
-        .delete_reaction(&h, &token, &note_id)
-        .await?;
+    state.client.delete_reaction(&h, &token, &note_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -790,22 +822,20 @@ async fn sse_events(
         .r#type
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
 
-    let stream = BroadcastStream::new(rx).filter_map(move |result| {
-        match result {
-            Ok(sse_event) => {
-                if let Some(ref filter) = type_filter {
-                    if !filter.iter().any(|f| sse_event.event_type.starts_with(f)) {
-                        return None;
-                    }
+    let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+        Ok(sse_event) => {
+            if let Some(ref filter) = type_filter {
+                if !filter.iter().any(|f| sse_event.event_type.starts_with(f)) {
+                    return None;
                 }
-                let event = Event::default()
-                    .event(&sse_event.event_type)
-                    .json_data(&sse_event.data)
-                    .ok()?;
-                Some(Ok(event))
             }
-            Err(_) => None,
+            let event = Event::default()
+                .event(&sse_event.event_type)
+                .json_data(&sse_event.data)
+                .ok()?;
+            Some(Ok(event))
         }
+        Err(_) => None,
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -826,11 +856,7 @@ struct TimelineQueryParams {
 
 impl TimelineQueryParams {
     fn into_timeline_options(self) -> crate::models::TimelineOptions {
-        crate::models::TimelineOptions::new(
-            self.limit.unwrap_or(20),
-            self.since_id,
-            self.until_id,
-        )
+        crate::models::TimelineOptions::new(self.limit.unwrap_or(20), self.since_id, self.until_id)
     }
 }
 
