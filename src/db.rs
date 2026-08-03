@@ -92,6 +92,45 @@ impl Default for ChatEvictionConfig {
 
 /// SQLite database with separate reader/writer connections.
 /// WAL mode allows concurrent reads while writing.
+/// 走査を中断した位置。継続時はこの行より後ろから読み直す。
+///
+/// 「最後に**走査した**行」を指す。最後にマッチした行を指すと、その間にあった
+/// マッチしない行を再開時にもう一度読むことになる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedNoteCursor {
+    pub created_at: String,
+    pub note_id: String,
+}
+
+/// `scan_cached_notes` の結果。
+#[derive(Debug, Clone, Default)]
+pub struct CachedNoteScan {
+    /// 述語が true を返したノート
+    pub notes: Vec<NormalizedNote>,
+    /// 実際に読んだ行数
+    pub scanned: usize,
+    /// 述語が判定できなかった行 + JSON として読めなかった行の数
+    pub errors: usize,
+    /// 走査上限で打ち切ったときの継続位置。読み切った場合は None
+    pub cursor: Option<CachedNoteCursor>,
+}
+
+/// FTS5 の MATCH 文字列を組み立てる。リテラルは AND 結合し、`"` は doubling で
+/// エスケープする。trigram が成立しない 3 文字未満は落とす (押し込むと 0 件に
+/// なり偽陰性を生むため)。押し込めるものが無ければ None = FTS を使わない。
+fn build_fts_match_query(literals: &[String]) -> Option<String> {
+    let quoted: Vec<String> = literals
+        .iter()
+        .filter(|l| l.chars().count() >= 3)
+        .map(|l| format!("\"{}\"", l.replace('"', "\"\"")))
+        .collect();
+    if quoted.is_empty() {
+        None
+    } else {
+        Some(quoted.join(" AND "))
+    }
+}
+
 pub struct Database {
     writer: Mutex<Connection>,
     reader: Mutex<Connection>,
@@ -600,6 +639,152 @@ impl Database {
             .into_iter()
             .filter_map(|json_str| serde_json::from_str::<NormalizedNote>(&json_str).ok())
             .collect())
+    }
+
+    /// キャッシュ済みノートを走査し、呼び出し側の述語で絞り込む。
+    ///
+    /// クエリ機能 (notedeck の カラムクエリ #783) のように、判定ロジックが
+    /// 呼び出し側にしかない検索のための API。この層は「FTS で粗く絞って行を
+    /// 読み、述語に渡す」だけで、述語の意味論には関与しない。
+    ///
+    /// - `fts_literals`: FTS5 に押し込むリテラル群 (AND 結合)。空なら全件走査。
+    ///   偽陰性を避けるため、trigram が成立しない 3 文字未満は無視する
+    /// - `limit`: 返すノートの上限
+    /// - `max_scanned_rows`: 走査する行数の上限。到達したら打ち切って
+    ///   継続カーソルを返す (巨大キャッシュで応答が返らなくなるのを防ぐ)
+    /// - `pred`: `None` を返すと per-note エラーとして除外し件数に計上する
+    ///
+    /// DB ロックはチャンク単位で取り直す。述語の評価はロックの外で行うので、
+    /// 重い述語が他の DB 利用者を待たせない。
+    pub fn scan_cached_notes<F>(
+        &self,
+        account_id: &str,
+        fts_literals: &[String],
+        limit: usize,
+        max_scanned_rows: usize,
+        after: Option<&CachedNoteCursor>,
+        mut pred: F,
+    ) -> Result<CachedNoteScan, NoteDeckError>
+    where
+        F: FnMut(&NormalizedNote) -> Option<bool>,
+    {
+        /// 1 度のロックで読む行数
+        const CHUNK: usize = 200;
+
+        let mut out = CachedNoteScan::default();
+        if limit == 0 || max_scanned_rows == 0 {
+            return Ok(out);
+        }
+
+        // trigram が成立しない短いリテラルを押し込むと 0 件になり偽陰性になる。
+        // 呼び出し側で弾く約束だが、影響が致命的なのでここでも落とす
+        let match_query = build_fts_match_query(fts_literals);
+
+        let mut cursor = after.cloned();
+        let mut exhausted = false;
+
+        while out.notes.len() < limit && out.scanned < max_scanned_rows {
+            let take = CHUNK.min(max_scanned_rows - out.scanned);
+            let rows = self.fetch_scan_chunk(account_id, match_query.as_deref(), &cursor, take)?;
+            if rows.is_empty() {
+                exhausted = true;
+                break;
+            }
+            let fetched = rows.len();
+            let mut hit_limit = false;
+            for (note_id, created_at, json) in rows {
+                out.scanned += 1;
+                cursor = Some(CachedNoteCursor {
+                    created_at,
+                    note_id,
+                });
+                match serde_json::from_str::<NormalizedNote>(&json) {
+                    Ok(note) => match pred(&note) {
+                        Some(true) => {
+                            out.notes.push(note);
+                            if out.notes.len() >= limit {
+                                hit_limit = true;
+                                break;
+                            }
+                        }
+                        Some(false) => {}
+                        // 述語が判定できなかった (型エラー等)
+                        None => out.errors += 1,
+                    },
+                    // スキーマ世代差・破損行も per-note エラーとして扱う
+                    Err(_) => out.errors += 1,
+                }
+            }
+            // limit で止めた場合はこのチャンクを読み切っていないので、
+            // 「読み切った」判定に落とさずカーソルを残す
+            if hit_limit {
+                break;
+            }
+            if fetched < take {
+                exhausted = true;
+                break;
+            }
+        }
+
+        out.cursor = if exhausted { None } else { cursor };
+        Ok(out)
+    }
+
+    /// 走査の 1 チャンクを読む。ロックはこの関数の中だけで保持する。
+    fn fetch_scan_chunk(
+        &self,
+        account_id: &str,
+        match_query: Option<&str>,
+        cursor: &Option<CachedNoteCursor>,
+        take: usize,
+    ) -> Result<Vec<(String, String, String)>, NoteDeckError> {
+        let conn = self.lock_read()?;
+        let mut conditions = vec!["nc.account_id = ?1".to_string()];
+        let mut idx = 2u32;
+        if match_query.is_some() {
+            conditions.push(format!(
+                "nc.rowid IN (SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?{idx})"
+            ));
+            idx += 1;
+        }
+        if cursor.is_some() {
+            // created_at の同値で分かれても順序が定まるよう note_id を副キーにする
+            conditions.push(format!(
+                "(nc.created_at < ?{idx} OR (nc.created_at = ?{idx} AND nc.note_id < ?{}))",
+                idx + 1
+            ));
+            idx += 2;
+        }
+        let sql = format!(
+            "SELECT nc.note_id, nc.created_at, nc.note_json FROM notes_cache nc WHERE {} \
+             ORDER BY nc.created_at DESC, nc.note_id DESC LIMIT ?{idx}",
+            conditions.join(" AND "),
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params.push(Box::new(account_id.to_string()));
+        if let Some(q) = match_query {
+            params.push(Box::new(q.to_string()));
+        }
+        if let Some(c) = cursor {
+            params.push(Box::new(c.created_at.clone()));
+            params.push(Box::new(c.note_id.clone()));
+        }
+        params.push(Box::new(take as i64));
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+        Ok(rows)
     }
 
     pub fn get_cached_timeline(
@@ -2333,5 +2518,186 @@ mod tests {
             .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].text.as_deref(), Some("edited"));
+    }
+
+    // --- scan_cached_notes (predicate 注入) ---
+
+    /// 走査用に created_at をずらしたノートを作る (新しい順は id の降順)
+    fn scan_note(id: &str, text: &str, seq: u32) -> NormalizedNote {
+        let mut note = sample_note(id, text);
+        note.created_at = format!("2025-01-01T00:00:{seq:02}Z");
+        note
+    }
+
+    fn seed_scan_notes(db: &Database) {
+        let notes = vec![
+            scan_note("n1", "alpha bravo", 1),
+            scan_note("n2", "alpha charlie", 2),
+            scan_note("n3", "delta echo", 3),
+            scan_note("n4", "alpha foxtrot", 4),
+        ];
+        db.cache_notes(&notes, "home").unwrap();
+    }
+
+    #[test]
+    fn scan_filters_by_predicate() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let out = db
+            .scan_cached_notes("acc-1", &[], 10, 100, None, |n| {
+                Some(n.text.as_deref().unwrap_or("").contains("alpha"))
+            })
+            .unwrap();
+        assert_eq!(out.notes.len(), 3);
+        assert_eq!(out.scanned, 4);
+        assert_eq!(out.errors, 0);
+        assert!(out.cursor.is_none(), "読み切ったらカーソルは返さない");
+    }
+
+    #[test]
+    fn scan_returns_notes_newest_first() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let out = db
+            .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
+            .unwrap();
+        let ids: Vec<&str> = out.notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n4", "n3", "n2", "n1"]);
+    }
+
+    #[test]
+    fn scan_uses_fts_prefilter() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let out = db
+            .scan_cached_notes("acc-1", &["delta".to_string()], 10, 100, None, |_| {
+                Some(true)
+            })
+            .unwrap();
+        // FTS で 1 行に絞られるので、述語に渡る行も 1 件だけ
+        assert_eq!(out.scanned, 1);
+        assert_eq!(out.notes.len(), 1);
+        assert_eq!(out.notes[0].id, "n3");
+    }
+
+    #[test]
+    fn scan_ignores_too_short_literals() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        // 3 文字未満を押し込むと trigram が 0 件を返して偽陰性になるので無視する
+        let out = db
+            .scan_cached_notes("acc-1", &["ab".to_string()], 10, 100, None, |_| Some(true))
+            .unwrap();
+        assert_eq!(out.scanned, 4, "FTS を使わず全件走査するべき");
+    }
+
+    #[test]
+    fn scan_stops_at_limit() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let out = db
+            .scan_cached_notes("acc-1", &[], 2, 100, None, |_| Some(true))
+            .unwrap();
+        assert_eq!(out.notes.len(), 2);
+        assert!(out.cursor.is_some(), "続きがあるならカーソルを返す");
+    }
+
+    #[test]
+    fn scan_resumes_from_cursor_without_gap_or_overlap() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        // 走査上限 2 行で打ち切る
+        let first = db
+            .scan_cached_notes("acc-1", &[], 10, 2, None, |_| Some(true))
+            .unwrap();
+        assert_eq!(first.scanned, 2);
+        let cursor = first.cursor.expect("打ち切ったらカーソルが返る");
+
+        let second = db
+            .scan_cached_notes("acc-1", &[], 10, 10, Some(&cursor), |_| Some(true))
+            .unwrap();
+        let mut all: Vec<String> = first.notes.iter().map(|n| n.id.clone()).collect();
+        all.extend(second.notes.iter().map(|n| n.id.clone()));
+        assert_eq!(
+            all,
+            vec!["n4", "n3", "n2", "n1"],
+            "取りこぼしも重複もなく続きが読める"
+        );
+    }
+
+    #[test]
+    fn scan_counts_predicate_errors() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let out = db
+            .scan_cached_notes("acc-1", &[], 10, 100, None, |n| {
+                // n3 だけ判定不能にする
+                if n.id == "n3" {
+                    None
+                } else {
+                    Some(true)
+                }
+            })
+            .unwrap();
+        assert_eq!(out.errors, 1);
+        assert_eq!(out.notes.len(), 3, "判定不能なノートは除外する");
+    }
+
+    #[test]
+    fn scan_counts_broken_rows_as_errors() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        {
+            // note_json を壊す (スキーマ世代差で読めない行の代役)
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE notes_cache SET note_json = '{ broken' WHERE note_id = 'n2'",
+                [],
+            )
+            .unwrap();
+        }
+        let out = db
+            .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
+            .unwrap();
+        assert_eq!(out.errors, 1);
+        assert_eq!(out.notes.len(), 3);
+        assert_eq!(out.scanned, 4, "読めない行も走査行数には数える");
+    }
+
+    #[test]
+    fn scan_is_scoped_to_account() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let mut other = scan_note("n9", "alpha", 9);
+        other.account_id = "acc-2".to_string();
+        db.cache_notes(&[other], "home").unwrap();
+
+        let out = db
+            .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
+            .unwrap();
+        assert!(out.notes.iter().all(|n| n.account_id == "acc-1"));
+    }
+
+    #[test]
+    fn scan_handles_zero_limits() {
+        let (_dir, db) = temp_db();
+        seed_scan_notes(&db);
+        let out = db
+            .scan_cached_notes("acc-1", &[], 0, 100, None, |_| Some(true))
+            .unwrap();
+        assert!(out.notes.is_empty());
+        assert_eq!(out.scanned, 0);
+    }
+
+    #[test]
+    fn fts_match_query_escapes_quotes() {
+        let q = build_fts_match_query(&["say \"hi\" now".to_string()]).unwrap();
+        assert_eq!(q, "\"say \"\"hi\"\" now\"");
+    }
+
+    #[test]
+    fn fts_match_query_joins_with_and() {
+        let q = build_fts_match_query(&["alpha".to_string(), "bravo".to_string()]).unwrap();
+        assert_eq!(q, "\"alpha\" AND \"bravo\"");
     }
 }
