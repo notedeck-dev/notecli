@@ -1049,9 +1049,11 @@ impl Database {
             return Ok(0);
         }
 
-        let conn = self.lock_write()?;
         let mut total_deleted: u64 = 0;
 
+        // writer lock はフェーズ単位で取り直す。②のチャンク分割は tx だけでなく
+        // Mutex も手放さないと意味がない (握ったままだと ingest_notes 等の
+        // lock_write 呼び出しがトリム完走まで待たされる)。
         // ① TTL (単一 tx)
         if let Some(ttl_days) = config.ttl_days {
             let now = std::time::SystemTime::now()
@@ -1059,6 +1061,7 @@ impl Database {
                 .unwrap_or_default()
                 .as_secs() as i64;
             let ttl_cutoff = now - ttl_days * 86_400;
+            let conn = self.lock_write()?;
             let tx = conn.unchecked_transaction()?;
             let n = tx.execute(
                 "DELETE FROM notes_cache WHERE cached_at < ?1",
@@ -1068,13 +1071,14 @@ impl Database {
             total_deleted += n as u64;
         }
 
-        // ② per-timeline トリム (チャンク分割 tx)
+        // ② per-timeline トリム (チャンクごとに lock + tx)
         if let Some(per_timeline_limit) = config.per_timeline_limit {
-            total_deleted += self.trim_timelines_chunked(&conn, per_timeline_limit)?;
+            total_deleted += self.trim_timelines_chunked(per_timeline_limit)?;
         }
 
         // ③ per-account hard cap (単一 tx)
         if let Some(per_account_limit) = config.per_account_limit {
+            let conn = self.lock_write()?;
             let tx = conn.unchecked_transaction()?;
             // SQLite 3.25+ の window function で 1 クエリで評価。
             let n = tx.execute(
@@ -1102,13 +1106,13 @@ impl Database {
     /// per-timeline トリムの実体。victim (バケット上限超過の membership) を
     /// チャンクごとの tx で削除し、victim のうち所属ゼロになった entity を
     /// 同一 tx で掃除する。戻り値は削除した membership + entity の総行数。
-    fn trim_timelines_chunked(
-        &self,
-        conn: &Connection,
-        per_timeline_limit: i64,
-    ) -> Result<u64, NoteDeckError> {
+    fn trim_timelines_chunked(&self, per_timeline_limit: i64) -> Result<u64, NoteDeckError> {
         let mut total: u64 = 0;
         loop {
+            // チャンクごとに writer lock を取り直す。ここで Mutex を手放すことで
+            // WS ingest や他コマンドの書込がトリムの合間に割り込める
+            // (握りっぱなしだと 1M 行規模で分オーダーの停止になる)。
+            let conn = self.lock_write()?;
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
                 "CREATE TEMP TABLE IF NOT EXISTS trim_victims (
@@ -3345,6 +3349,49 @@ mod tests {
         assert_eq!(remaining[0].id, "n4");
         assert_eq!(remaining[1].id, "n3");
         assert_eq!(db.account_cache_count("acc-1").unwrap(), 2);
+    }
+
+    #[test]
+    fn per_timeline_trim_releases_writer_lock_between_chunks() {
+        // チャンク分割の目的は writer Mutex を手放して他の書込を割り込ませること。
+        // lock を握りっぱなしだと (tx だけ分割しても) この ingest は完走まで待たされる。
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(&dir.path().join("test.db")).unwrap());
+        for i in 0..200 {
+            db.ingest_notes(
+                &[note_with_created_at(
+                    &format!("n{i:03}"),
+                    "acc-1",
+                    &format!("2025-06-01T00:00:{:02}Z", i % 60),
+                )],
+                &tk("home"),
+            )
+            .unwrap();
+        }
+
+        let trimmer = Arc::clone(&db);
+        let handle = std::thread::spawn(move || {
+            trimmer
+                .cleanup_with_eviction(&EvictionConfig {
+                    per_account_limit: None,
+                    ttl_days: None,
+                    per_timeline_limit: Some(1),
+                })
+                .unwrap()
+        });
+
+        // トリム中でも新規 ingest が完了できる (デッドロック・恒久ブロックしない)
+        db.ingest_notes(&[note_for_account("concurrent", "acc-1")], &tk("social"))
+            .unwrap();
+        let deleted = handle.join().unwrap();
+        assert!(deleted > 0);
+        assert_eq!(
+            db.get_cached_timeline("acc-1", &tk("social"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
