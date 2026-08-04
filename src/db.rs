@@ -841,6 +841,11 @@ impl Database {
     /// 呼び出し側にしかない検索のための API。この層は「FTS で粗く絞って行を
     /// 読み、述語に渡す」だけで、述語の意味論には関与しない。
     ///
+    /// - `scope`: `Some(key)` なら当該バケット (note_timelines の所属) に
+    ///   限定して走査する。カラムのタイムライン種別で正しく絞れる —
+    ///   実体/所属分離 (issue #30) 以前は所属が後勝ち上書きで母集合を
+    ///   保証できなかったため全体走査しかなかった。`None` は従来どおり
+    ///   アカウントの全キャッシュを走査する
     /// - `fts_literals`: FTS5 に押し込むリテラル群 (AND 結合)。空なら全件走査。
     ///   偽陰性を避けるため、trigram が成立しない 3 文字未満は無視する
     /// - `limit`: 返すノートの上限
@@ -848,11 +853,20 @@ impl Database {
     ///   継続カーソルを返す (巨大キャッシュで応答が返らなくなるのを防ぐ)
     /// - `pred`: `None` を返すと per-note エラーとして除外し件数に計上する
     ///
+    /// カーソルの互換性: scope あり走査は membership の `(sort_key, note_id)` を
+    /// キーに進むが、sort_key = note.created_at (§3) のため `CachedNoteCursor`
+    /// の形・意味は scope なし走査と同一。ただしカーソルは同じ scope の
+    /// 続き読みにのみ使うこと (scope を跨ぐと順序前提が崩れる)。
+    ///
     /// DB ロックはチャンク単位で取り直す。述語の評価はロックの外で行うので、
     /// 重い述語が他の DB 利用者を待たせない。
+    // 走査の絞り (scope/fts/cursor) と上限 (limit/max_scanned_rows) は独立に
+    // 意味を持つ引数で、束ねる struct を作るほどの呼び出し面がない
+    #[allow(clippy::too_many_arguments)]
     pub fn scan_cached_notes<F>(
         &self,
         account_id: &str,
+        scope: Option<&TimelineKey>,
         fts_literals: &[String],
         limit: usize,
         max_scanned_rows: usize,
@@ -879,7 +893,8 @@ impl Database {
 
         while out.notes.len() < limit && out.scanned < max_scanned_rows {
             let take = CHUNK.min(max_scanned_rows - out.scanned);
-            let rows = self.fetch_scan_chunk(account_id, match_query.as_deref(), &cursor, take)?;
+            let rows =
+                self.fetch_scan_chunk(account_id, scope, match_query.as_deref(), &cursor, take)?;
             if rows.is_empty() {
                 exhausted = true;
                 break;
@@ -925,9 +940,15 @@ impl Database {
     }
 
     /// 走査の 1 チャンクを読む。ロックはこの関数の中だけで保持する。
+    ///
+    /// scope あり: membership を `idx_note_timelines_order` の seek で辿り
+    /// entity を PK lookup する (sort_key = created_at のためタプルの形は
+    /// scope なしと同一)。scope なし: 従来どおり entity を
+    /// `idx_notes_cache_timeline` (account_id, created_at DESC) で走査する。
     fn fetch_scan_chunk(
         &self,
         account_id: &str,
+        scope: Option<&TimelineKey>,
         match_query: Option<&str>,
         cursor: &Option<CachedNoteCursor>,
         take: usize,
@@ -935,6 +956,23 @@ impl Database {
         let conn = self.lock_read()?;
         let mut conditions = vec!["nc.account_id = ?1".to_string()];
         let mut idx = 2u32;
+        let scoped = scope.is_some();
+        let (from_clause, sort_col, id_col) = if scoped {
+            conditions.push(format!("m.timeline_key = ?{idx}"));
+            idx += 1;
+            (
+                "note_timelines m JOIN notes_cache nc \
+                 ON nc.note_id = m.note_id AND nc.account_id = m.account_id",
+                "m.sort_key",
+                "m.note_id",
+            )
+        } else {
+            ("notes_cache nc", "nc.created_at", "nc.note_id")
+        };
+        // scoped 側の account 条件も membership を駆動させる
+        if scoped {
+            conditions[0] = "m.account_id = ?1".to_string();
+        }
         if match_query.is_some() {
             conditions.push(format!(
                 "nc.rowid IN (SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?{idx})"
@@ -942,21 +980,25 @@ impl Database {
             idx += 1;
         }
         if cursor.is_some() {
-            // created_at の同値で分かれても順序が定まるよう note_id を副キーにする
+            // created_at (= sort_key) の同値で分かれても順序が定まるよう
+            // note_id を副キーにする
             conditions.push(format!(
-                "(nc.created_at < ?{idx} OR (nc.created_at = ?{idx} AND nc.note_id < ?{}))",
+                "({sort_col} < ?{idx} OR ({sort_col} = ?{idx} AND {id_col} < ?{}))",
                 idx + 1
             ));
             idx += 2;
         }
         let sql = format!(
-            "SELECT nc.note_id, nc.created_at, nc.note_json FROM notes_cache nc WHERE {} \
-             ORDER BY nc.created_at DESC, nc.note_id DESC LIMIT ?{idx}",
+            "SELECT {id_col}, {sort_col}, nc.note_json FROM {from_clause} WHERE {} \
+             ORDER BY {sort_col} DESC, {id_col} DESC LIMIT ?{idx}",
             conditions.join(" AND "),
         );
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         params.push(Box::new(account_id.to_string()));
+        if let Some(key) = scope {
+            params.push(Box::new(key.as_canonical()));
+        }
         if let Some(q) = match_query {
             params.push(Box::new(q.to_string()));
         }
@@ -2886,7 +2928,7 @@ mod tests {
         let (_dir, db) = temp_db();
         seed_scan_notes(&db);
         let out = db
-            .scan_cached_notes("acc-1", &[], 10, 100, None, |n| {
+            .scan_cached_notes("acc-1", None, &[], 10, 100, None, |n| {
                 Some(n.text.as_deref().unwrap_or("").contains("alpha"))
             })
             .unwrap();
@@ -2901,7 +2943,7 @@ mod tests {
         let (_dir, db) = temp_db();
         seed_scan_notes(&db);
         let out = db
-            .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 10, 100, None, |_| Some(true))
             .unwrap();
         let ids: Vec<&str> = out.notes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, vec!["n4", "n3", "n2", "n1"]);
@@ -2912,7 +2954,7 @@ mod tests {
         let (_dir, db) = temp_db();
         seed_scan_notes(&db);
         let out = db
-            .scan_cached_notes("acc-1", &["delta".to_string()], 10, 100, None, |_| {
+            .scan_cached_notes("acc-1", None, &["delta".to_string()], 10, 100, None, |_| {
                 Some(true)
             })
             .unwrap();
@@ -2928,7 +2970,9 @@ mod tests {
         seed_scan_notes(&db);
         // 3 文字未満を押し込むと trigram が 0 件を返して偽陰性になるので無視する
         let out = db
-            .scan_cached_notes("acc-1", &["ab".to_string()], 10, 100, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &["ab".to_string()], 10, 100, None, |_| {
+                Some(true)
+            })
             .unwrap();
         assert_eq!(out.scanned, 4, "FTS を使わず全件走査するべき");
     }
@@ -2938,7 +2982,7 @@ mod tests {
         let (_dir, db) = temp_db();
         seed_scan_notes(&db);
         let out = db
-            .scan_cached_notes("acc-1", &[], 2, 100, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 2, 100, None, |_| Some(true))
             .unwrap();
         assert_eq!(out.notes.len(), 2);
         assert!(out.cursor.is_some(), "続きがあるならカーソルを返す");
@@ -2950,13 +2994,13 @@ mod tests {
         seed_scan_notes(&db);
         // 走査上限 2 行で打ち切る
         let first = db
-            .scan_cached_notes("acc-1", &[], 10, 2, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 10, 2, None, |_| Some(true))
             .unwrap();
         assert_eq!(first.scanned, 2);
         let cursor = first.cursor.expect("打ち切ったらカーソルが返る");
 
         let second = db
-            .scan_cached_notes("acc-1", &[], 10, 10, Some(&cursor), |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 10, 10, Some(&cursor), |_| Some(true))
             .unwrap();
         let mut all: Vec<String> = first.notes.iter().map(|n| n.id.clone()).collect();
         all.extend(second.notes.iter().map(|n| n.id.clone()));
@@ -2972,7 +3016,7 @@ mod tests {
         let (_dir, db) = temp_db();
         seed_scan_notes(&db);
         let out = db
-            .scan_cached_notes("acc-1", &[], 10, 100, None, |n| {
+            .scan_cached_notes("acc-1", None, &[], 10, 100, None, |n| {
                 // n3 だけ判定不能にする
                 if n.id == "n3" {
                     None
@@ -2999,7 +3043,7 @@ mod tests {
             .unwrap();
         }
         let out = db
-            .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 10, 100, None, |_| Some(true))
             .unwrap();
         assert_eq!(out.errors, 1);
         assert_eq!(out.notes.len(), 3);
@@ -3015,9 +3059,117 @@ mod tests {
         db.ingest_notes(&[other], &tk("home")).unwrap();
 
         let out = db
-            .scan_cached_notes("acc-1", &[], 10, 100, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 10, 100, None, |_| Some(true))
             .unwrap();
         assert!(out.notes.iter().all(|n| n.account_id == "acc-1"));
+    }
+
+    #[test]
+    fn scan_scoped_to_bucket_filters_by_membership() {
+        // #783 のカラムクエリが「種別で絞ると取りこぼす」妥協をしていた点の解消:
+        // scope 指定で当該バケット所属のみが母集合になる (§12-9)
+        let (_dir, db) = temp_db();
+        db.ingest_notes(&[scan_note("home-1", "alpha topic", 1)], &tk("home"))
+            .unwrap();
+        db.ingest_notes(
+            &[scan_note("antenna-1", "alpha topic", 2)],
+            &tk("antenna:a1"),
+        )
+        .unwrap();
+        // 両方に所属するノート
+        let shared = scan_note("shared-1", "alpha topic", 3);
+        db.ingest_notes(std::slice::from_ref(&shared), &tk("home"))
+            .unwrap();
+        db.ingest_notes(&[shared], &tk("antenna:a1")).unwrap();
+
+        let out = db
+            .scan_cached_notes("acc-1", Some(&tk("antenna:a1")), &[], 10, 100, None, |_| {
+                Some(true)
+            })
+            .unwrap();
+        let ids: Vec<&str> = out.notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["shared-1", "antenna-1"],
+            "バケット所属のみ・sort_key 降順"
+        );
+
+        // scope なしは従来どおり全体走査
+        let all = db
+            .scan_cached_notes("acc-1", None, &[], 10, 100, None, |_| Some(true))
+            .unwrap();
+        assert_eq!(all.notes.len(), 3);
+    }
+
+    #[test]
+    fn scan_scoped_cursor_resumes_within_bucket() {
+        let (_dir, db) = temp_db();
+        for i in 0..5 {
+            db.ingest_notes(&[scan_note(&format!("a{i}"), "text", i)], &tk("antenna:a1"))
+                .unwrap();
+        }
+        // バケット外のノート (カーソル継続に混入しないこと)
+        db.ingest_notes(&[scan_note("h1", "text", 10)], &tk("home"))
+            .unwrap();
+
+        let scope = tk("antenna:a1");
+        let first = db
+            .scan_cached_notes("acc-1", Some(&scope), &[], 10, 2, None, |_| Some(true))
+            .unwrap();
+        assert_eq!(first.notes.len(), 2);
+        let cursor = first.cursor.expect("打ち切りで継続カーソルが返る");
+
+        let rest = db
+            .scan_cached_notes("acc-1", Some(&scope), &[], 10, 100, Some(&cursor), |_| {
+                Some(true)
+            })
+            .unwrap();
+        assert_eq!(rest.notes.len(), 3, "残り全件を重複なく回収");
+        assert!(rest.cursor.is_none(), "読み切ったらカーソルなし");
+        let mut all: Vec<String> = first
+            .notes
+            .iter()
+            .chain(rest.notes.iter())
+            .map(|n| n.id.clone())
+            .collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn scan_scoped_with_fts_prefilter() {
+        let (_dir, db) = temp_db();
+        db.ingest_notes(
+            &[scan_note("hit", "unique-zebra topic", 1)],
+            &tk("antenna:a1"),
+        )
+        .unwrap();
+        db.ingest_notes(
+            &[scan_note("miss-text", "other topic", 2)],
+            &tk("antenna:a1"),
+        )
+        .unwrap();
+        // FTS には合うがバケット外
+        db.ingest_notes(
+            &[scan_note("miss-bucket", "unique-zebra topic", 3)],
+            &tk("home"),
+        )
+        .unwrap();
+
+        let out = db
+            .scan_cached_notes(
+                "acc-1",
+                Some(&tk("antenna:a1")),
+                &["unique-zebra".to_string()],
+                10,
+                100,
+                None,
+                |_| Some(true),
+            )
+            .unwrap();
+        let ids: Vec<&str> = out.notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["hit"], "FTS プリフィルタとバケット絞りの積");
     }
 
     #[test]
@@ -3025,7 +3177,7 @@ mod tests {
         let (_dir, db) = temp_db();
         seed_scan_notes(&db);
         let out = db
-            .scan_cached_notes("acc-1", &[], 0, 100, None, |_| Some(true))
+            .scan_cached_notes("acc-1", None, &[], 0, 100, None, |_| Some(true))
             .unwrap();
         assert!(out.notes.is_empty());
         assert_eq!(out.scanned, 0);
