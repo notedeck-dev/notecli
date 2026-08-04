@@ -1,6 +1,6 @@
 [package]
 name = "notecli"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Headless Misskey client — CLI & library"
 repository = "https://github.com/notedeck-dev/notecli"

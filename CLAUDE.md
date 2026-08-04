@@ -66,7 +66,7 @@ git push origin vX.Y.Z
 
 ## コーディング規約
 
-- エラー型は `error.rs` の `NotecliError` に統一
+- エラー型は `error.rs` の `NoteDeckError` に統一（歴史的な名前。notedeck / notetui / notebot も同名で参照している）
 - API トークンをログ・エラーメッセージに含めない（`safe_message()` を使用）
 - 認証情報は keychain 優先、DB フォールバック
 - 新しい Misskey API エンドポイントは `api.rs` の `MisskeyClient` に追加
