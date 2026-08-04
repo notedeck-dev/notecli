@@ -45,7 +45,12 @@ pub async fn run_cli(
             return match cache_cmd {
                 crate::cli::CacheCommands::Sweep => {
                     let deleted = db.sweep_orphan_notes()?;
-                    println!("Removed {deleted} orphan note(s) from cache");
+                    crate::format::print_action(
+                        fmt,
+                        &format!(r#"{{"removed":{deleted}}}"#),
+                        &deleted.to_string(),
+                        &format!("Removed {deleted} orphan note(s) from cache"),
+                    );
                     Ok(())
                 }
             }

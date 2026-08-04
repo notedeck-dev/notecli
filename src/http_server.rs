@@ -145,15 +145,15 @@ impl From<crate::error::NoteDeckError> for ApiError {
         let code = e.code().to_string();
         let status = match &e {
             // クライアント入力起因 (不正なタイムラインキー等) は 400。
-            // InvalidInput の Display はキー文字列等の入力のみでトークンを含まない
-            // ため e.to_string() のままでよい。
             crate::error::NoteDeckError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
             status,
             code,
-            message: e.to_string(),
+            // 外部へ出すメッセージは必ず safe_message() を通す。Display は
+            // Internal / Database の内部詳細をそのまま含み得る。
+            message: e.safe_message(),
         }
     }
 }

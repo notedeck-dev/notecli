@@ -489,6 +489,18 @@ pub enum TimelineKey {
 /// bare 単独で現れたら parse エラーになる prefix 予約語
 const RESERVED_PREFIXES: [&str; 6] = ["user-list", "antenna", "channel", "role", "clip", "user"];
 
+/// `Basic` タイムライン名として許す形（lowercase ASCII 英数 + `-`）か。
+///
+/// 名前は API パス (`notes/{t}-timeline`) と WS チャンネル名 (`{t}Timeline`) へ
+/// 直接補間されるため、パス区切りやクエリ文字を含む名前を通すとリクエスト先を
+/// 差し替えられてしまう。既知のフォーク TL (bubble / vmimi-relay / hanami 等) は
+/// すべてこの形に収まる。
+fn is_valid_basic_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// kebab-case を lowerCamelCase に変換（"vmimi-relay" → "vmimiRelay"）。
 /// Misskey の WS チャンネル名は lowerCamel、endpoint は kebab が慣行。
 fn kebab_to_lower_camel(s: &str) -> String {
@@ -553,7 +565,15 @@ impl TimelineKey {
                 _ if RESERVED_PREFIXES.contains(&s) => Err(NoteDeckError::InvalidInput(format!(
                     "bare reserved timeline key '{s}' (id required)"
                 ))),
-                _ => Ok(Self::Basic(s.to_string())),
+                // Basic 名は `api_endpoint` が `notes/{t}-timeline` として API パスへ
+                // 補間し、`ws_channel` が `{t}Timeline` としてチャンネル名にする。
+                // `/` `.` `?` `#` 等を許すとリクエスト先そのものを差し替えられる
+                // (例: `../../admin/x?` → `/api/admin/x`) ため、Misskey の TL 命名
+                // 慣行どおり lowercase kebab に限定する。
+                _ if is_valid_basic_name(s) => Ok(Self::Basic(s.to_string())),
+                _ => Err(NoteDeckError::InvalidInput(format!(
+                    "invalid basic timeline key '{s}'"
+                ))),
             }
         }
     }
@@ -2046,6 +2066,30 @@ mod tests {
             "antenna:\x01abc",
         ] {
             assert!(TimelineKey::parse(s).is_err(), "expected Err for {s:?}");
+        }
+    }
+
+    #[test]
+    fn timeline_key_rejects_path_unsafe_basic_names() {
+        // Basic 名は API パス (notes/{t}-timeline) へ補間されるため、リクエスト先を
+        // 差し替え得る文字を含む名前は parse で弾く
+        for s in [
+            "../../admin/x?",
+            "notes/../admin",
+            "home/x",
+            "home?x",
+            "home#x",
+            "home.x",
+            "home%2f",
+            "home x",
+            "Home",   // 大文字は endpoint scan 由来の実キーに現れない
+            "ホーム", // 非 ASCII
+        ] {
+            assert!(TimelineKey::parse(s).is_err(), "expected Err for {s:?}");
+        }
+        // 既知のフォーク TL は従来どおり通ること
+        for s in ["home", "bubble", "vmimi-relay", "hanami", "yami2"] {
+            assert!(TimelineKey::parse(s).is_ok(), "expected Ok for {s:?}");
         }
     }
 
