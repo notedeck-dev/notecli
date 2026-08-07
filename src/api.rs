@@ -79,7 +79,7 @@ impl MisskeyClient {
     }
 
     #[cfg(test)]
-    fn with_base_url(base_url: &str) -> Self {
+    pub(crate) fn with_base_url(base_url: &str) -> Self {
         Self {
             client: Client::new(),
             base_url: Some(base_url.to_string()),

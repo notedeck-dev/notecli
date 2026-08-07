@@ -1768,6 +1768,16 @@ struct PollSubState {
     since_id: Option<String>,
 }
 
+/// main チャンネル相当 (通知/メンション) の polling カーソル (notedeck#1003)。
+/// primed が立つまでは emit しない — 初回サイクルは「取得済みの最新 ID」を
+/// 基準点として確立するだけ。過去分をまとめて配ると OS 通知が大量発火する。
+#[derive(Default)]
+struct MainPollState {
+    primed: bool,
+    notif_since_id: Option<String>,
+    mention_since_id: Option<String>,
+}
+
 /// Top-level polling task. Periodically fetches notes for all active subscriptions.
 #[allow(clippy::too_many_arguments)]
 async fn polling_loop(
@@ -1784,6 +1794,7 @@ async fn polling_loop(
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut sub_states: HashMap<String, PollSubState> = HashMap::new();
+    let mut main_state = MainPollState::default();
     // Cached reaction counts for captured notes (for diff detection).
     let mut note_reaction_cache: HashMap<String, HashMap<String, i64>> = HashMap::new();
     let mut consecutive_failures: u64 = 0;
@@ -1870,6 +1881,139 @@ async fn polling_loop(
                         "polling fetch failed"
                     );
                     poll_failed = true;
+                }
+            }
+        }
+
+        // main チャンネル相当 (通知/メンション) の polling (notedeck#1003)。
+        // WS の main と同じイベント種別で emit するため、下流の query
+        // ルーティング / OS 通知 / 未読バッジは WS モードとそのまま共通で動く。
+        // #984 の dedup により main 購読はアカウントあたり高々 1 本。
+        let main_sub_id: Option<String> = {
+            let subs = subscriptions.read().await;
+            subs.iter()
+                .find(|(_, info)| {
+                    info.account_id == account_id
+                        && info.active
+                        && matches!(info.target, SubscriptionTarget::Main)
+                })
+                .map(|(id, _)| id.clone())
+        };
+        if let Some(sub_id) = &main_sub_id {
+            if !main_state.primed {
+                // 初回はカーソル確立のみで emit しない (MainPollState の doc 参照)。
+                // 片方でも失敗したら primed を立てず次サイクルでやり直す
+                let notif_head = api_client
+                    .get_notifications(
+                        &host,
+                        &token,
+                        &account_id,
+                        TimelineOptions::new(1, None, None),
+                    )
+                    .await;
+                let mention_head = api_client
+                    .get_timeline(
+                        &host,
+                        &token,
+                        &account_id,
+                        &TimelineKey::Mentions,
+                        TimelineOptions::new(1, None, None),
+                    )
+                    .await;
+                match (notif_head, mention_head) {
+                    (Ok(notifs), Ok(mentions)) => {
+                        main_state.notif_since_id = notifs.first().map(|n| n.id.clone());
+                        main_state.mention_since_id = mentions.first().map(|m| m.id.clone());
+                        main_state.primed = true;
+                        consecutive_failures = 0;
+                    }
+                    (notif_res, mention_res) => {
+                        for e in [notif_res.err(), mention_res.err()].into_iter().flatten() {
+                            tracing::warn!(
+                                account_id = %account_id,
+                                error = %e,
+                                "main polling prime failed"
+                            );
+                        }
+                        poll_failed = true;
+                    }
+                }
+            } else {
+                match api_client
+                    .get_notifications(
+                        &host,
+                        &token,
+                        &account_id,
+                        TimelineOptions::new(30, main_state.notif_since_id.clone(), None),
+                    )
+                    .await
+                {
+                    Ok(notifs) if !notifs.is_empty() => {
+                        main_state.notif_since_id = Some(notifs[0].id.clone());
+                        for notification in notifs.into_iter().rev() {
+                            let payload = StreamNotificationEvent {
+                                account_id: account_id.clone(),
+                                subscription_id: sub_id.clone(),
+                                notification,
+                            };
+                            emit_both(
+                                emitter.as_ref(),
+                                &event_bus,
+                                StreamEvent::Notification(Box::new(payload)),
+                            );
+                        }
+                        consecutive_failures = 0;
+                    }
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            account_id = %account_id,
+                            error = %e,
+                            "notification polling failed"
+                        );
+                        poll_failed = true;
+                    }
+                }
+
+                match api_client
+                    .get_timeline(
+                        &host,
+                        &token,
+                        &account_id,
+                        &TimelineKey::Mentions,
+                        TimelineOptions::new(30, main_state.mention_since_id.clone(), None),
+                    )
+                    .await
+                {
+                    Ok(notes) if !notes.is_empty() => {
+                        main_state.mention_since_id = Some(notes[0].id.clone());
+                        for note in notes.into_iter().rev() {
+                            let payload = StreamMentionEvent {
+                                account_id: account_id.clone(),
+                                subscription_id: sub_id.clone(),
+                                note: Arc::new(note),
+                            };
+                            emit_both(
+                                emitter.as_ref(),
+                                &event_bus,
+                                StreamEvent::Mention(Box::new(payload)),
+                            );
+                        }
+                        consecutive_failures = 0;
+                    }
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            account_id = %account_id,
+                            error = %e,
+                            "mention polling failed"
+                        );
+                        poll_failed = true;
+                    }
                 }
             }
         }
@@ -2501,6 +2645,131 @@ mod tests {
         assert!(
             drain_status(&mut rx).contains(&StreamConnectionState::Connected),
             "冪等 return でも現在状態を emit すること"
+        );
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn polling_delivers_main_channel_notifications_and_mentions() {
+        // ポーリングモードでは main チャンネル (WS) が無いため、通知・メンションの
+        // 取得経路がそもそも存在しなかった (notedeck#1003)。polling_loop が main
+        // 購読を検出して i/notifications / notes/mentions を定期取得し、WS と同じ
+        // イベント種別で配ることを検証する。初回サイクルはカーソル確立のみで
+        // emit しない (過去分をまとめて OS 通知として発火させないため)。
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn raw_note_json(id: &str, text: &str) -> serde_json::Value {
+            json!({
+                "id": id,
+                "createdAt": "2025-01-01T00:00:00.000Z",
+                "text": text,
+                "user": {"id": "u1", "username": "taka"},
+                "visibility": "public"
+            })
+        }
+        fn raw_notification_json(id: &str) -> serde_json::Value {
+            json!({
+                "id": id,
+                "createdAt": "2025-01-01T00:00:00.000Z",
+                "type": "reaction",
+                "user": {"id": "u1", "username": "taka"},
+                "note": raw_note_json("n1", "hello"),
+                "reaction": ":star:"
+            })
+        }
+
+        let server = MockServer::start().await;
+        // 初回 prime (limit 1・sinceId なし): 既存分を返す。emit されないこと
+        Mock::given(method("POST"))
+            .and(path("/api/i/notifications"))
+            .and(body_partial_json(json!({"limit": 1})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([raw_notification_json("notif-old")])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/mentions"))
+            .and(body_partial_json(json!({"limit": 1})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([raw_note_json("m-old", "old")])),
+            )
+            .mount(&server)
+            .await;
+        // 2 回目以降: prime で確立したカーソル付きで新着を返す
+        Mock::given(method("POST"))
+            .and(path("/api/i/notifications"))
+            .and(body_partial_json(json!({"sinceId": "notif-old"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([raw_notification_json("notif-new")])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/mentions"))
+            .and(body_partial_json(json!({"sinceId": "m-old"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([raw_note_json("m-new", "new")])),
+            )
+            .mount(&server)
+            .await;
+        // それ以外 (消化後のカーソル付きリクエスト等) は空
+        Mock::given(method("POST"))
+            .and(path("/api/i/notifications"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/notes/mentions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut manager =
+            StreamingManager::new(Arc::new(ChannelEmitter(tx)), Arc::new(EventBus::new()), db);
+        manager.api_client = Arc::new(MisskeyClient::with_base_url(&server.uri()));
+
+        manager
+            .set_mode("acc-1", "127.0.0.1:1", "token", "polling", Some(100))
+            .await
+            .unwrap();
+        manager.subscribe_main("acc-1").await.unwrap();
+
+        // prime → 次サイクルの新着 emit まで待つ
+        let mut notif_ids = Vec::new();
+        let mut mention_ids = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (notif_ids.is_empty() || mention_ids.is_empty())
+            && tokio::time::Instant::now() < deadline
+        {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(StreamEvent::Notification(e))) => {
+                    assert_eq!(e.account_id, "acc-1");
+                    notif_ids.push(e.notification.id.clone());
+                }
+                Ok(Some(StreamEvent::Mention(e))) => {
+                    assert_eq!(e.account_id, "acc-1");
+                    mention_ids.push(e.note.id.clone());
+                }
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+
+        // prime 分 (notif-old / m-old) は emit されず、新着だけが届く
+        assert_eq!(notif_ids, vec!["notif-new"], "通知は新着のみ配信されること");
+        assert_eq!(
+            mention_ids,
+            vec!["m-new"],
+            "メンションは新着のみ配信されること"
         );
 
         manager.disconnect("acc-1").await;
