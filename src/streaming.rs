@@ -1778,6 +1778,14 @@ struct MainPollState {
     mention_since_id: Option<String>,
 }
 
+/// チャット購読ごとの polling カーソル (notedeck#1008)。prime の意味は
+/// MainPollState と同じ。
+#[derive(Default)]
+struct ChatPollState {
+    primed: bool,
+    since_id: Option<String>,
+}
+
 /// Top-level polling task. Periodically fetches notes for all active subscriptions.
 #[allow(clippy::too_many_arguments)]
 async fn polling_loop(
@@ -1795,6 +1803,7 @@ async fn polling_loop(
 ) {
     let mut sub_states: HashMap<String, PollSubState> = HashMap::new();
     let mut main_state = MainPollState::default();
+    let mut chat_states: HashMap<String, ChatPollState> = HashMap::new();
     // Cached reaction counts for captured notes (for diff detection).
     let mut note_reaction_cache: HashMap<String, HashMap<String, i64>> = HashMap::new();
     let mut consecutive_failures: u64 = 0;
@@ -2014,6 +2023,118 @@ async fn polling_loop(
                         );
                         poll_failed = true;
                     }
+                }
+            }
+        }
+
+        // チャット購読 (chatUser / chatRoom) の polling (notedeck#1008)。
+        // WS と同じ ChatMessage イベントで emit する。chat は subscription_id
+        // で 1:1 配送されるため購読 ID をそのまま載せる。メッセージ挿入のみ
+        // 対応 (既読/リアクション/削除の polling 追随はスコープ外)。
+        let chat_snapshot: Vec<(String, SubscriptionTarget)> = {
+            let subs = subscriptions.read().await;
+            subs.iter()
+                .filter(|(_, info)| info.account_id == account_id && info.active)
+                .filter_map(|(id, info)| match &info.target {
+                    t @ (SubscriptionTarget::ChatUser { .. }
+                    | SubscriptionTarget::ChatRoom { .. }) => Some((id.clone(), t.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        // DB キャッシュに own user_id が要る (WS 受信側と同じ)。アカウントは
+        // 不変なのでサイクルごとに 1 回だけ引く
+        let own_user_id: Option<String> = if chat_snapshot.is_empty() {
+            None
+        } else {
+            db.get_account(&account_id)
+                .ok()
+                .flatten()
+                .map(|a| a.user_id.clone())
+        };
+        for (sub_id, target) in &chat_snapshot {
+            let state = chat_states.entry(sub_id.clone()).or_default();
+            let (limit, since) = if state.primed {
+                (30, state.since_id.clone())
+            } else {
+                // 初回はカーソル確立のみで emit しない
+                (1, None)
+            };
+            let result = match target {
+                SubscriptionTarget::ChatUser { other_id } => {
+                    api_client
+                        .get_chat_user_messages(
+                            &host,
+                            &token,
+                            other_id,
+                            limit,
+                            since.as_deref(),
+                            None,
+                        )
+                        .await
+                }
+                SubscriptionTarget::ChatRoom { room_id } => {
+                    api_client
+                        .get_chat_room_messages(
+                            &host,
+                            &token,
+                            room_id,
+                            limit,
+                            since.as_deref(),
+                            None,
+                        )
+                        .await
+                }
+                _ => unreachable!("chat_snapshot filters to chat targets"),
+            };
+            match result {
+                Ok(messages) => {
+                    if let Some(newest) = messages.first() {
+                        state.since_id = Some(newest.id.clone());
+                    }
+                    if state.primed {
+                        for msg in messages.into_iter().rev() {
+                            if let Some(user_id) = &own_user_id {
+                                let db = db.clone();
+                                let msg_for_cache = msg.clone();
+                                let account_id_owned = account_id.clone();
+                                let host_owned = host.clone();
+                                let user_id = user_id.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = db.cache_chat_message(
+                                        &msg_for_cache,
+                                        &account_id_owned,
+                                        &user_id,
+                                        &host_owned,
+                                    ) {
+                                        tracing::warn!(error = %e, "failed to cache polled chat message");
+                                    }
+                                });
+                            }
+                            let payload = StreamChatMessageEvent {
+                                account_id: account_id.clone(),
+                                subscription_id: sub_id.clone(),
+                                message: msg,
+                            };
+                            emit_both(
+                                emitter.as_ref(),
+                                &event_bus,
+                                StreamEvent::ChatMessage(Box::new(payload)),
+                            );
+                        }
+                    } else {
+                        state.primed = true;
+                    }
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        account_id = %account_id,
+                        subscription_id = %sub_id,
+                        error = %e,
+                        "chat polling failed"
+                    );
+                    poll_failed = true;
                 }
             }
         }
@@ -2770,6 +2891,107 @@ mod tests {
             mention_ids,
             vec!["m-new"],
             "メンションは新着のみ配信されること"
+        );
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn polling_delivers_chat_messages() {
+        // ポーリングモードではチャット購読 (chatUser / chatRoom) の取得経路が
+        // 存在しなかった (notedeck#1008)。polling_loop がチャット購読を検出して
+        // user-timeline / room-timeline を定期取得し、WS と同じ ChatMessage
+        // イベントで配ることを検証する。chat は subscription_id で 1:1 配送
+        // されるため、購読 ID が正しく載ることも見る。
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn chat_message_json(id: &str) -> serde_json::Value {
+            json!({
+                "id": id,
+                "createdAt": "2025-01-01T00:00:00.000Z",
+                "fromUserId": "u-other",
+                "fromUser": {"id": "u-other", "name": null, "username": "they",
+                             "host": null, "avatarUrl": null},
+                "toUserId": "u-self",
+                "toUser": {"id": "u-self", "name": null, "username": "me",
+                           "host": null, "avatarUrl": null},
+                "toRoomId": null,
+                "toRoom": null,
+                "text": "hi",
+                "fileId": null,
+                "file": null,
+                "isRead": false,
+                "reactions": []
+            })
+        }
+
+        let server = MockServer::start().await;
+        // 初回 prime (limit 1): 既存分。emit されないこと
+        Mock::given(method("POST"))
+            .and(path("/api/chat/messages/user-timeline"))
+            .and(body_partial_json(json!({"limit": 1})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([chat_message_json("msg-old")])),
+            )
+            .mount(&server)
+            .await;
+        // 2 回目以降: カーソル付きで新着
+        Mock::given(method("POST"))
+            .and(path("/api/chat/messages/user-timeline"))
+            .and(body_partial_json(json!({"sinceId": "msg-old"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([chat_message_json("msg-new")])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat/messages/user-timeline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Database::open(&dir.path().join("test.db")).unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut manager =
+            StreamingManager::new(Arc::new(ChannelEmitter(tx)), Arc::new(EventBus::new()), db);
+        manager.api_client = Arc::new(MisskeyClient::with_base_url(&server.uri()));
+
+        manager
+            .set_mode("acc-1", "127.0.0.1:1", "token", "polling", Some(100))
+            .await
+            .unwrap();
+        let sub_id = manager
+            .subscribe_chat_user("acc-1", "u-other")
+            .await
+            .unwrap();
+
+        let mut message_ids = Vec::new();
+        let mut sub_ids = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while message_ids.is_empty() && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(StreamEvent::ChatMessage(e))) => {
+                    assert_eq!(e.account_id, "acc-1");
+                    message_ids.push(e.message.id.clone());
+                    sub_ids.push(e.subscription_id.clone());
+                }
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            message_ids,
+            vec!["msg-new"],
+            "チャットは新着のみ配信されること"
+        );
+        assert_eq!(
+            sub_ids,
+            vec![sub_id],
+            "1:1 配送に使う subscription_id が購読 ID と一致すること"
         );
 
         manager.disconnect("acc-1").await;
