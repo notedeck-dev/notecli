@@ -785,11 +785,33 @@ impl StreamingManager {
         let (channel, params) = info.channel_and_params().ok_or_else(|| {
             NoteDeckError::InvalidInput("subscription target has no streaming channel".to_string())
         })?;
-        self.send_subscribe(account_id, &channel, &sub_id, params)
-            .await?;
 
-        let mut subs = self.subscriptions.write().await;
-        subs.insert(sub_id.clone(), info);
+        {
+            let mut subs = self.subscriptions.write().await;
+            // main は Misskey の shouldShare チャンネル: 同一 WS 接続への 2 本目の
+            // connect はサーバーが黙って無視する (ack も来ない) ため、張れるのは
+            // 実質 1 本だけ。既存の購読 ID を返してアカウントごとに 1 本に保つ。
+            if matches!(info.target, SubscriptionTarget::Main) {
+                let existing = subs.iter().find_map(|(id, i)| {
+                    (i.account_id == account_id && matches!(i.target, SubscriptionTarget::Main))
+                        .then(|| id.clone())
+                });
+                if let Some(existing) = existing {
+                    return Ok(existing);
+                }
+            }
+            // send より先に登録して check-and-insert を原子的にする
+            // (send 失敗時は下でロールバック)。
+            subs.insert(sub_id.clone(), info);
+        }
+
+        if let Err(e) = self
+            .send_subscribe(account_id, &channel, &sub_id, params)
+            .await
+        {
+            self.subscriptions.write().await.remove(&sub_id);
+            return Err(e);
+        }
 
         Ok(sub_id)
     }
@@ -799,6 +821,18 @@ impl StreamingManager {
         account_id: &str,
         subscription_id: &str,
     ) -> Result<(), NoteDeckError> {
+        // main は共有チャンネル (通知・メンション・OS 通知・未読バッジが同居)。
+        // カラム都合の unsubscribe で切ると他の消費者ごと無音になるので no-op。
+        // 解放経路は disconnect のみ。
+        {
+            let subs = self.subscriptions.read().await;
+            if let Some(info) = subs.get(subscription_id) {
+                if matches!(info.target, SubscriptionTarget::Main) {
+                    return Ok(());
+                }
+            }
+        }
+
         // Send unsubscribe to WebSocket if in realtime mode
         let conns = self.connections.lock().await;
         if let Some(handle) = conns.get(account_id) {
@@ -834,6 +868,10 @@ impl StreamingManager {
                 return Err(NoteDeckError::InvalidInput(
                     "subscription account mismatch".to_string(),
                 ));
+            }
+            // main は viewport 予算の対象外 (unsubscribe と同じ理由で no-op)。
+            if matches!(info.target, SubscriptionTarget::Main) {
+                return Ok(());
             }
             if !info.active {
                 return Ok(());
@@ -2231,6 +2269,60 @@ mod tests {
         manager.resume_subscription("acc-1", &sub).await.unwrap();
 
         manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_main_is_deduped_per_account() {
+        // Misskey の main は shouldShare チャンネルで、同一 WS 接続に 2 本目を
+        // connect してもサーバーが黙って無視する (エラーも返らない)。
+        // 同一アカウントの subscribe_main は既存の購読 ID を返して 1 本に保つ。
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1", "acc-2"]).await;
+
+        let first = manager.subscribe_main("acc-1").await.unwrap();
+        let second = manager.subscribe_main("acc-1").await.unwrap();
+        assert_eq!(first, second, "同一アカウントの main は同じ購読 ID を返す");
+
+        let other = manager.subscribe_main("acc-2").await.unwrap();
+        assert_ne!(first, other, "別アカウントの main は独立");
+
+        let subs = manager.subscriptions.read().await;
+        let main_count = subs
+            .values()
+            .filter(|info| matches!(info.target, SubscriptionTarget::Main))
+            .count();
+        assert_eq!(main_count, 2, "表にはアカウントごとに 1 エントリだけ");
+        drop(subs);
+
+        manager.disconnect("acc-1").await;
+        manager.disconnect("acc-2").await;
+    }
+
+    #[tokio::test]
+    async fn main_subscription_survives_unsubscribe_and_suspend() {
+        // main はカラムの購読ではなくアカウントセッションのチャンネル。
+        // 通知・メンション・OS 通知・未読バッジが全部ぶら下がるので、
+        // カラム close (unsubscribe) や viewport 予算の suspend で
+        // 共有 main を巻き添えにしてはならない。解放は disconnect のみ。
+        let (_dir, manager, _rx) = manager_with_dead_connection(&["acc-1"]).await;
+        let sub = manager.subscribe_main("acc-1").await.unwrap();
+
+        manager.unsubscribe("acc-1", &sub).await.unwrap();
+        assert!(
+            manager.subscriptions.read().await.contains_key(&sub),
+            "unsubscribe しても main は表に残る"
+        );
+
+        manager.suspend_subscription("acc-1", &sub).await.unwrap();
+        assert!(
+            manager.subscriptions.read().await[&sub].active,
+            "suspend しても main は active のまま"
+        );
+
+        manager.disconnect("acc-1").await;
+        assert!(
+            !manager.subscriptions.read().await.contains_key(&sub),
+            "disconnect では main も解放される"
+        );
     }
 
     #[tokio::test]
