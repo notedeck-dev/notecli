@@ -472,6 +472,23 @@ impl StreamingManager {
         host: &str,
         token: &str,
     ) -> Result<(), NoteDeckError> {
+        // polling がこのアカウントのストリームを供給中なら WS を張らない。
+        // connect は「ストリームを現在のモードで確保する」であって「WS を
+        // 強制する」ではない。カラムのマウントや復帰は connect を無条件に
+        // 呼ぶため、ここで弾かないと polling モードが黙って崩れる
+        // (notedeck#1004)。WS へ戻す唯一の経路は set_mode("realtime")。
+        {
+            let polls = self.poll_connections.lock().await;
+            if polls.contains_key(account_id) {
+                self.emitter
+                    .emit(StreamEvent::Status(Box::new(StreamStatusEvent {
+                        account_id: account_id.to_string(),
+                        state: StreamConnectionState::Connected,
+                    })));
+                return Ok(());
+            }
+        }
+
         let mut conns = self.connections.lock().await;
         if let Some(handle) = conns.get(account_id) {
             // 冪等 return でも現在の実状態を emit する。フロントは復帰時に
@@ -2453,6 +2470,38 @@ mod tests {
         assert!(manager.poll_connections.lock().await.is_empty());
         assert_eq!(manager.connections.lock().await.len(), 1);
         assert!(manager.subscriptions.read().await.contains_key(&sub));
+
+        manager.disconnect("acc-1").await;
+    }
+
+    #[tokio::test]
+    async fn connect_does_not_resurrect_websocket_while_polling() {
+        // フロントはカラムのマウントや復帰のたびに connect() を無条件に呼ぶ。
+        // polling 中に WS が復活すると、永続化されたモードと実動作が乖離する
+        // (notedeck#1004)。connect は「ストリームを現在のモードで確保する」であって
+        // 「WS を強制する」ではない。
+        let (_dir, manager, mut rx) = manager_with_dead_connection(&["acc-1"]).await;
+        manager
+            .set_mode("acc-1", "127.0.0.1:1", "token", "polling", Some(60_000))
+            .await
+            .unwrap();
+        drain_status(&mut rx);
+
+        manager
+            .connect("acc-1", "127.0.0.1:1", "token")
+            .await
+            .unwrap();
+
+        assert!(
+            manager.connections.lock().await.is_empty(),
+            "polling 中の connect は WS を張らない"
+        );
+        assert!(manager.poll_connections.lock().await.contains_key("acc-1"));
+        // polling がストリームを供給中なので Connected として報告する
+        assert!(
+            drain_status(&mut rx).contains(&StreamConnectionState::Connected),
+            "冪等 return でも現在状態を emit すること"
+        );
 
         manager.disconnect("acc-1").await;
     }
