@@ -6,6 +6,7 @@ pub mod error;
 pub mod event_bus;
 pub mod format;
 pub mod http_server;
+pub mod identity;
 pub(crate) mod insecure;
 pub mod keychain;
 pub mod models;
