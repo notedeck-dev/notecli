@@ -164,6 +164,8 @@ pub struct CachedSearchOptions<'a> {
     pub author: Option<&'a str>,
     /// Some(true) = 添付あり、Some(false) = 添付なし
     pub has_files: Option<bool>,
+    /// true なら visibility が public のノートだけ (AI など第三者に見せる面用)
+    pub public_only: bool,
 }
 
 impl Database {
@@ -876,6 +878,7 @@ impl Database {
             ascending,
             author,
             has_files,
+            public_only,
         } = *opts;
         let conn = self.lock_read()?;
         let order = if ascending { "ASC" } else { "DESC" };
@@ -948,6 +951,9 @@ impl Database {
             } else {
                 "json_array_length(nc.note_json, '$.files') = 0".to_string()
             });
+        }
+        if public_only {
+            conditions.push("json_extract(nc.note_json, '$.visibility') = 'public'".to_string());
         }
 
         let sql = format!(
@@ -4169,6 +4175,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(without_files.len(), 2);
+    }
+
+    #[test]
+    fn search_cached_notes_across_public_only_drops_private_notes() {
+        let (_dir, db) = temp_db();
+        let public = variant("n1", "acc-1", "a.example", None);
+        let mut followers = variant("n2", "acc-1", "a.example", None);
+        followers.visibility = "followers".to_string();
+        let mut specified = variant("n3", "acc-1", "a.example", None);
+        specified.visibility = "specified".to_string();
+        db.ingest_notes(&[public, followers, specified], &tk("home"))
+            .unwrap();
+
+        let all = db
+            .search_cached_notes_across(
+                &["acc-1"],
+                &CachedSearchOptions {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        let only_public = db
+            .search_cached_notes_across(
+                &["acc-1"],
+                &CachedSearchOptions {
+                    limit: 10,
+                    public_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(only_public.len(), 1);
+        assert_eq!(only_public[0].id, "n1");
     }
 
     #[test]
