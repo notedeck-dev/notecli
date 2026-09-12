@@ -136,6 +136,20 @@ pub struct NormalizedNote {
     pub account_id: String,
     #[serde(rename = "_serverHost")]
     pub server_host: String,
+    /// 同一性キー (正規化 AP object id)。導出は `identity::identity_of` (notedeck#1058)。
+    /// 旧 JSON には無いので default で読み、`fill_identity` で補う。
+    #[serde(rename = "_identity", default)]
+    pub identity: String,
+    /// identity の host == 取得元サーバー (このビューが origin か)
+    #[serde(rename = "_isOrigin", default)]
+    pub is_origin: bool,
+    /// 整合検査: リモート投稿者の host と identity の host が一致するか。
+    /// ローカル投稿者 (user.host = None) は identity を自分で組むので常に true。
+    #[serde(rename = "_identityTrusted", default)]
+    pub identity_trusted: bool,
+    /// サーバーが本文を隠した状態 (packed の isHidden)。ミュート由来の非表示とは別概念。
+    #[serde(default)]
+    pub content_hidden: bool,
     pub created_at: String,
     pub text: Option<String>,
     pub cw: Option<String>,
@@ -1450,6 +1464,9 @@ pub struct RawNote {
     pub visible_user_ids: Vec<String>,
     #[serde(default)]
     pub is_favorited: bool,
+    /// packed の isHidden (followers/specified の非可視、投稿者の隠す設定、未ログイン制限)
+    #[serde(default)]
+    pub is_hidden: bool,
     pub reply: Option<Box<RawNote>>,
     pub renote: Option<Box<RawNote>>,
     /// Catch-all for fork-specific fields (e.g., isNoteInYamiMode)
@@ -1718,12 +1735,63 @@ impl From<RawEmoji> for ServerEmoji {
 
 // --- Conversion: Raw -> Normalized ---
 
+/// identity / is_origin / identity_trusted を (uri, server_host, id, user.host) から計算する。
+fn identity_fields(
+    uri: Option<&str>,
+    server_host: &str,
+    note_id: &str,
+    user_host: Option<&str>,
+) -> (String, bool, bool) {
+    let identity = crate::identity::identity_of(uri, server_host, note_id);
+    let ident_host = crate::identity::identity_host(&identity);
+    let is_origin =
+        ident_host.as_deref() == Some(crate::identity::normalize_host(server_host).as_str());
+    let identity_trusted = match user_host {
+        Some(h) => ident_host.as_deref() == Some(crate::identity::normalize_host(h).as_str()),
+        None => true,
+    };
+    (identity, is_origin, identity_trusted)
+}
+
+impl NormalizedNote {
+    /// identity 系フィールドを再計算する (reply / renote も再帰)。
+    /// DB から読み出した旧 JSON (`_identity` 無し) の補完に使う。決定的なので
+    /// 既に値がある行に適用しても同値になる。
+    pub fn fill_identity(&mut self) {
+        let (identity, is_origin, identity_trusted) = identity_fields(
+            self.uri.as_deref(),
+            &self.server_host,
+            &self.id,
+            self.user.host.as_deref(),
+        );
+        self.identity = identity;
+        self.is_origin = is_origin;
+        self.identity_trusted = identity_trusted;
+        if let Some(r) = self.reply.as_mut() {
+            r.fill_identity();
+        }
+        if let Some(r) = self.renote.as_mut() {
+            r.fill_identity();
+        }
+    }
+}
+
 impl RawNote {
     pub fn normalize(self, account_id: &str, server_host: &str) -> NormalizedNote {
+        let (identity, is_origin, identity_trusted) = identity_fields(
+            self.uri.as_deref(),
+            server_host,
+            &self.id,
+            self.user.host.as_deref(),
+        );
         NormalizedNote {
             id: self.id,
             account_id: account_id.to_string(),
             server_host: server_host.to_string(),
+            identity,
+            is_origin,
+            identity_trusted,
+            content_hidden: self.is_hidden,
             created_at: self.created_at,
             text: self.text,
             cw: self.cw,
@@ -2836,5 +2904,98 @@ mod tests {
         let back: ServerDetection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.host, "misskey.io");
         assert_eq!(back.software_version, "2024.1.0");
+    }
+
+    // ---- identity (notedeck#1058) ----
+
+    #[test]
+    fn normalize_derives_identity_for_local_note() {
+        let raw: RawNote = serde_json::from_value(raw_note_json()).unwrap();
+        let note = raw.normalize("acc1", "misskey.io");
+        assert_eq!(note.identity, "https://misskey.io/notes/n1");
+        assert!(note.is_origin);
+        assert!(note.identity_trusted);
+        assert!(!note.content_hidden);
+    }
+
+    #[test]
+    fn normalize_derives_identity_for_remote_note_and_checks_author_host() {
+        let mut v = raw_note_json();
+        v["uri"] = serde_json::json!("https://origin.example/notes/x1");
+        v["user"]["host"] = serde_json::json!("origin.example");
+        let note: NormalizedNote = serde_json::from_value::<RawNote>(v.clone())
+            .unwrap()
+            .normalize("acc1", "misskey.io");
+        assert_eq!(note.identity, "https://origin.example/notes/x1");
+        assert!(!note.is_origin);
+        assert!(note.identity_trusted);
+
+        // 投稿者 host と uri の host が食い違えば不整合
+        v["user"]["host"] = serde_json::json!("evil.example");
+        let spoofed: NormalizedNote = serde_json::from_value::<RawNote>(v)
+            .unwrap()
+            .normalize("acc1", "misskey.io");
+        assert!(!spoofed.identity_trusted);
+    }
+
+    #[test]
+    fn normalize_passes_is_hidden_through_as_content_hidden() {
+        let mut v = raw_note_json();
+        v["isHidden"] = serde_json::json!(true);
+        let note = serde_json::from_value::<RawNote>(v)
+            .unwrap()
+            .normalize("acc1", "misskey.io");
+        assert!(note.content_hidden);
+        // mode_flags には混ざらない
+        assert!(!note.mode_flags.contains_key("isHidden"));
+    }
+
+    #[test]
+    fn normalize_recurses_identity_into_renote_and_reply() {
+        let mut v = raw_note_json();
+        let mut inner = raw_note_json();
+        inner["id"] = serde_json::json!("inner1");
+        inner["uri"] = serde_json::json!("https://origin.example/notes/inner1");
+        inner["user"]["host"] = serde_json::json!("origin.example");
+        v["renote"] = inner.clone();
+        v["reply"] = inner;
+        let note = serde_json::from_value::<RawNote>(v)
+            .unwrap()
+            .normalize("acc1", "misskey.io");
+        let renote = note.renote.as_ref().unwrap();
+        assert_eq!(renote.identity, "https://origin.example/notes/inner1");
+        assert!(!renote.is_origin);
+        assert_eq!(
+            note.reply.as_ref().unwrap().identity,
+            "https://origin.example/notes/inner1"
+        );
+    }
+
+    #[test]
+    fn fill_identity_recomputes_from_legacy_json() {
+        let raw: RawNote = serde_json::from_value(raw_note_json()).unwrap();
+        let note = raw.normalize("acc1", "misskey.io");
+        let mut json: Value = serde_json::to_value(&note).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("_identity");
+        obj.remove("_isOrigin");
+        obj.remove("_identityTrusted");
+        let mut back: NormalizedNote = serde_json::from_value(json).unwrap();
+        assert_eq!(back.identity, "");
+        back.fill_identity();
+        assert_eq!(back.identity, note.identity);
+        assert_eq!(back.is_origin, note.is_origin);
+        assert_eq!(back.identity_trusted, note.identity_trusted);
+    }
+
+    #[test]
+    fn identity_fields_serialize_with_frontend_names() {
+        let raw: RawNote = serde_json::from_value(raw_note_json()).unwrap();
+        let note = raw.normalize("acc1", "misskey.io");
+        let json = serde_json::to_value(&note).unwrap();
+        assert_eq!(json["_identity"], "https://misskey.io/notes/n1");
+        assert_eq!(json["_isOrigin"], true);
+        assert_eq!(json["_identityTrusted"], true);
+        assert_eq!(json["contentHidden"], false);
     }
 }

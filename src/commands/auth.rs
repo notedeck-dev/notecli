@@ -53,6 +53,10 @@ pub fn run_accounts(db: &Database, fmt: OutputFormat) -> Result<(), NoteDeckErro
 }
 
 pub async fn run_login(db: &Database, host: &str, fmt: OutputFormat) -> Result<(), NoteDeckError> {
+    // NoteDeck 経路と同じく ASCII 小文字で保存する (accounts の (host, user_id) 一意制約と
+    // ノートの取得元 host を揃える。notedeck#1058)
+    let host = host.trim().to_ascii_lowercase();
+    let host = host.as_str();
     let client = MisskeyClient::new()?;
 
     let session_id = uuid::Uuid::new_v4().to_string();

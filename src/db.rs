@@ -597,13 +597,14 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         {
             let mut entity_stmt = tx.prepare_cached(
-                "INSERT INTO notes_cache (note_id, account_id, server_host, created_at, text, note_json, cached_at, uri)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO notes_cache (note_id, account_id, server_host, created_at, text, note_json, cached_at, uri, identity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(note_id, account_id) DO UPDATE SET
                      text = excluded.text,
                      note_json = excluded.note_json,
                      cached_at = excluded.cached_at,
-                     uri = excluded.uri",
+                     uri = excluded.uri,
+                     identity = excluded.identity",
             )?;
             let mut membership_stmt = tx.prepare_cached(
                 "INSERT INTO note_timelines (account_id, timeline_key, note_id, sort_key, added_at)
@@ -612,6 +613,13 @@ impl Database {
             )?;
             for note in notes {
                 let json = serde_json::to_string(note).unwrap_or_default();
+                // identity は normalize 済みなら埋まっている。旧 JSON 由来の
+                // 空値でも列だけは必ず埋める (backfill 待ちにしない)
+                let identity = if note.identity.is_empty() {
+                    crate::identity::identity_of(note.uri.as_deref(), &note.server_host, &note.id)
+                } else {
+                    note.identity.clone()
+                };
                 entity_stmt.execute(params![
                     note.id,
                     note.account_id,
@@ -621,6 +629,7 @@ impl Database {
                     json,
                     now,
                     note.uri,
+                    identity,
                 ])?;
                 membership_stmt.execute(params![
                     note.account_id,
@@ -719,6 +728,16 @@ impl Database {
         Ok(deleted as u64)
     }
 
+    /// notes_cache の note_json を NormalizedNote に戻す。スキーマ世代差・破損行は None。
+    /// identity 系フィールド (`_identity` / `_isOrigin` / `_identityTrusted`) は
+    /// 旧 JSON に無いので常に再計算して補う (決定的なので既存値と同値になる)。
+    /// 5 つの読み出し経路すべてがここを通る (述語評価より前に補うため)。
+    fn parse_cached_note(json: &str) -> Option<NormalizedNote> {
+        let mut note = serde_json::from_str::<NormalizedNote>(json).ok()?;
+        note.fill_identity();
+        Some(note)
+    }
+
     /// Find cached notes by ActivityPub URI across all accounts.
     /// Uses the partial index on `uri` for fast lookups.
     pub fn find_notes_by_uri(&self, uri: &str) -> Result<Vec<NormalizedNote>, NoteDeckError> {
@@ -731,11 +750,63 @@ impl Database {
         let mut notes = Vec::new();
         for row in rows {
             let json = row?;
-            if let Ok(note) = serde_json::from_str::<NormalizedNote>(&json) {
+            if let Some(note) = Self::parse_cached_note(&json) {
                 notes.push(note);
             }
         }
         Ok(notes)
+    }
+
+    /// identity (正規化 AP object id) でキャッシュを account 横断で引く (notedeck#1058)。
+    /// 引数は生の URI でもよい (同じ規則で正規化する)。backfill 完了前の行
+    /// (identity = '') は uri 列でフォールバックする。ローカル行と Renote の
+    /// `/activity` 行は backfill 完了まで拾えない (短い過渡)。
+    pub fn find_notes_by_identity(
+        &self,
+        uri_or_identity: &str,
+    ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
+        let identity = crate::identity::identity_of(Some(uri_or_identity), "", "");
+        let conn = self.lock_read()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT note_json FROM notes_cache WHERE identity = ?1 OR (identity = '' AND uri = ?1)",
+        )?;
+        let rows = stmt.query_map(params![identity], |row| row.get::<_, String>(0))?;
+        let mut notes = Vec::new();
+        for row in rows {
+            if let Some(note) = Self::parse_cached_note(&row?) {
+                notes.push(note);
+            }
+        }
+        Ok(notes)
+    }
+
+    /// V7 で追加した identity 列の backfill を 1 チャンク進める。戻り値は更新行数で、
+    /// 0 なら完了。identity は列 (uri / server_host / note_id) だけから導出できるので
+    /// JSON parse は要らない。1 チャンク = 1 tx で writer ロックを短く持つ
+    /// (WS 取り込みを止めない)。upsert とは同じロックで直列化され値は決定的なので
+    /// 競合しない。
+    pub fn backfill_identity_chunk(&self, chunk: usize) -> Result<u64, NoteDeckError> {
+        let conn = self.lock_write()?;
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<(i64, String, String, Option<String>)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT rowid, note_id, server_host, uri FROM notes_cache WHERE identity = '' LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map(params![chunk as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            mapped.collect::<rusqlite::Result<_>>()?
+        };
+        {
+            let mut upd =
+                tx.prepare_cached("UPDATE notes_cache SET identity = ?1 WHERE rowid = ?2")?;
+            for (rowid, note_id, server_host, uri) in &rows {
+                let identity = crate::identity::identity_of(uri.as_deref(), server_host, note_id);
+                upd.execute(params![identity, rowid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len() as u64)
     }
 
     pub fn search_cached_notes(
@@ -756,12 +827,41 @@ impl Database {
         until_date: Option<&str>,
         ascending: bool,
     ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
+        self.search_cached_notes_across(
+            &[account_id],
+            query,
+            limit,
+            since_date,
+            until_date,
+            ascending,
+        )
+    }
+
+    /// 複数アカウントを横断して検索する (notedeck#945 / #1058)。結果は variant
+    /// (アカウントごとの行) のまま返し、同一ノートの束ねは呼び出し側で行う。
+    /// `account_ids` が空なら空を返す。
+    pub fn search_cached_notes_across(
+        &self,
+        account_ids: &[&str],
+        query: &str,
+        limit: i64,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
+        ascending: bool,
+    ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.lock_read()?;
         let order = if ascending { "ASC" } else { "DESC" };
         let has_query = !query.is_empty();
 
-        let mut conditions = vec!["nc.account_id = ?1".to_string()];
-        let mut param_idx = 2u32;
+        let account_placeholders = (1..=account_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut conditions = vec![format!("nc.account_id IN ({account_placeholders})")];
+        let mut param_idx = account_ids.len() as u32 + 1;
 
         let fts_query;
         let like_pattern;
@@ -803,7 +903,9 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
 
         let mut dynamic_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        dynamic_params.push(Box::new(account_id.to_string()));
+        for id in account_ids {
+            dynamic_params.push(Box::new(id.to_string()));
+        }
         if use_fts {
             dynamic_params.push(Box::new(fts_query));
         }
@@ -831,7 +933,7 @@ impl Database {
 
         Ok(rows
             .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<NormalizedNote>(&json_str).ok())
+            .filter_map(|json_str| Self::parse_cached_note(&json_str))
             .collect())
     }
 
@@ -907,8 +1009,8 @@ impl Database {
                     created_at,
                     note_id,
                 });
-                match serde_json::from_str::<NormalizedNote>(&json) {
-                    Ok(note) => match pred(&note) {
+                match Self::parse_cached_note(&json) {
+                    Some(note) => match pred(&note) {
                         Some(true) => {
                             out.notes.push(note);
                             if out.notes.len() >= limit {
@@ -921,7 +1023,7 @@ impl Database {
                         None => out.errors += 1,
                     },
                     // スキーマ世代差・破損行も per-note エラーとして扱う
-                    Err(_) => out.errors += 1,
+                    None => out.errors += 1,
                 }
             }
             // limit で止めた場合はこのチャンクを読み切っていないので、
@@ -1046,7 +1148,7 @@ impl Database {
         let mut notes = Vec::new();
         for row in rows {
             let json_str = row?;
-            if let Ok(note) = serde_json::from_str::<NormalizedNote>(&json_str) {
+            if let Some(note) = Self::parse_cached_note(&json_str) {
                 notes.push(note);
             }
         }
@@ -1335,7 +1437,7 @@ impl Database {
         };
         Ok(jsons
             .iter()
-            .filter_map(|json| serde_json::from_str::<NormalizedNote>(json).ok())
+            .filter_map(|json| Self::parse_cached_note(json))
             .collect())
     }
 
@@ -2157,10 +2259,14 @@ mod tests {
     // --- Notes cache tests ---
 
     fn sample_note(id: &str, text: &str) -> NormalizedNote {
-        NormalizedNote {
+        let mut note = NormalizedNote {
             id: id.to_string(),
             account_id: "acc-1".to_string(),
             server_host: "misskey.io".to_string(),
+            identity: String::new(),
+            is_origin: false,
+            identity_trusted: false,
+            content_hidden: false,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             text: Some(text.to_string()),
             cw: None,
@@ -2199,7 +2305,9 @@ mod tests {
             mode_flags: HashMap::new(),
             reply: None,
             renote: None,
-        }
+        };
+        note.fill_identity();
+        note
     }
 
     #[test]
@@ -3760,5 +3868,192 @@ mod tests {
         // FTS 検索が移行後も動く
         let hits = db.search_cached_notes("acc-1", "migration", 10).unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    // ---- identity (notedeck#1058) ----
+
+    fn variant(id: &str, account_id: &str, host: &str, uri: Option<&str>) -> NormalizedNote {
+        let mut n = sample_note(id, "hello identity");
+        n.account_id = account_id.to_string();
+        n.server_host = host.to_string();
+        n.uri = uri.map(str::to_string);
+        n.fill_identity();
+        n
+    }
+
+    #[test]
+    fn find_notes_by_identity_bundles_local_row_and_activity_row() {
+        let (_dir, db) = temp_db();
+        // origin 側の純粋 Renote 行 (uri なし) と、連合先が Announce の id を uri に持つ行
+        let origin = variant("r1", "acc-1", "origin.example", None);
+        let remote = variant(
+            "localB",
+            "acc-2",
+            "b.example",
+            Some("https://origin.example/notes/r1/activity"),
+        );
+        db.ingest_notes(&[origin, remote], &tk("home")).unwrap();
+
+        let hits = db
+            .find_notes_by_identity("https://origin.example/notes/r1")
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        for n in &hits {
+            assert_eq!(n.identity, "https://origin.example/notes/r1");
+        }
+        let by_account: std::collections::HashSet<_> =
+            hits.iter().map(|n| n.account_id.as_str()).collect();
+        assert!(by_account.contains("acc-1") && by_account.contains("acc-2"));
+        // 生の URI の大文字 host でも同じ規則で正規化して引ける
+        let hits = db
+            .find_notes_by_identity("HTTPS://Origin.Example/notes/r1")
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn find_notes_by_identity_sets_origin_and_trusted_flags() {
+        let (_dir, db) = temp_db();
+        let mut origin = variant("x1", "acc-1", "origin.example", None);
+        origin.user.host = None;
+        let mut remote = variant(
+            "localB",
+            "acc-2",
+            "b.example",
+            Some("https://origin.example/notes/x1"),
+        );
+        remote.user.host = Some("origin.example".to_string());
+        let mut spoofed = variant(
+            "localC",
+            "acc-3",
+            "c.example",
+            Some("https://origin.example/notes/x1"),
+        );
+        spoofed.user.host = Some("evil.example".to_string());
+        spoofed.fill_identity();
+        db.ingest_notes(&[origin, remote, spoofed], &tk("home"))
+            .unwrap();
+
+        let hits = db
+            .find_notes_by_identity("https://origin.example/notes/x1")
+            .unwrap();
+        let get = |acc: &str| hits.iter().find(|n| n.account_id == acc).unwrap().clone();
+        assert!(get("acc-1").is_origin && get("acc-1").identity_trusted);
+        assert!(!get("acc-2").is_origin && get("acc-2").identity_trusted);
+        assert!(!get("acc-3").is_origin && !get("acc-3").identity_trusted);
+    }
+
+    #[test]
+    fn backfill_identity_chunk_fills_legacy_rows_and_uri_fallback_bridges_the_gap() {
+        let (_dir, db) = temp_db();
+        let local = variant("r1", "acc-1", "origin.example", None);
+        let remote = variant(
+            "localB",
+            "acc-2",
+            "b.example",
+            Some("https://origin.example/notes/r1"),
+        );
+        db.ingest_notes(&[local, remote], &tk("home")).unwrap();
+        // V7 直後の状態を再現: identity 列が空
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("UPDATE notes_cache SET identity = ''", [])
+                .unwrap();
+        }
+        // backfill 前: uri 列のフォールバックで remote だけ拾える (local 行は uri NULL)
+        let hits = db
+            .find_notes_by_identity("https://origin.example/notes/r1")
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].account_id, "acc-2");
+
+        // 1 行ずつ 2 回で完了、3 回目は 0
+        assert_eq!(db.backfill_identity_chunk(1).unwrap(), 1);
+        assert_eq!(db.backfill_identity_chunk(1).unwrap(), 1);
+        assert_eq!(db.backfill_identity_chunk(1).unwrap(), 0);
+
+        let hits = db
+            .find_notes_by_identity("https://origin.example/notes/r1")
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let conn = db.lock().unwrap();
+        let empty: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_cache WHERE identity = ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn parse_cached_note_fills_identity_for_legacy_json() {
+        let (_dir, db) = temp_db();
+        let note = variant("n1", "acc-1", "misskey.io", None);
+        db.ingest_notes(&[note], &tk("home")).unwrap();
+        // 旧世代の JSON (identity 系フィールド無し) を再現
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE notes_cache SET note_json = json_remove(note_json, '$._identity', '$._isOrigin', '$._identityTrusted')",
+                [],
+            )
+            .unwrap();
+            let json: String = conn
+                .query_row("SELECT note_json FROM notes_cache", [], |r| r.get(0))
+                .unwrap();
+            assert!(!json.contains("_identity"));
+        }
+        let notes = db.get_cached_timeline("acc-1", &tk("home"), 10).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].identity, "https://misskey.io/notes/n1");
+        assert!(notes[0].is_origin);
+        assert!(notes[0].identity_trusted);
+        // カラムクエリの走査経路も同じ補完を通る
+        let out = db
+            .scan_cached_notes("acc-1", None, &[], 10, 1000, None, |n: &NormalizedNote| {
+                Some(!n.identity.is_empty())
+            })
+            .unwrap();
+        assert_eq!(out.notes.len(), 1);
+    }
+
+    #[test]
+    fn search_cached_notes_across_returns_variants_of_all_accounts() {
+        let (_dir, db) = temp_db();
+        let a = variant(
+            "n1",
+            "acc-1",
+            "a.example",
+            Some("https://o.example/notes/z"),
+        );
+        let b = variant(
+            "n2",
+            "acc-2",
+            "b.example",
+            Some("https://o.example/notes/z"),
+        );
+        let other = variant("n3", "acc-3", "c.example", None);
+        db.ingest_notes(&[a, b, other], &tk("home")).unwrap();
+
+        let hits = db
+            .search_cached_notes_across(&["acc-1", "acc-2"], "identity", 10, None, None, false)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits
+            .iter()
+            .all(|n| n.identity == "https://o.example/notes/z"));
+        assert!(db
+            .search_cached_notes_across(&[], "identity", 10, None, None, false)
+            .unwrap()
+            .is_empty());
+        // 単一アカウント版は横断版の薄いラッパ
+        assert_eq!(
+            db.search_cached_notes("acc-3", "identity", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
