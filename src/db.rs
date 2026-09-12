@@ -149,6 +149,23 @@ pub struct Database {
     reader: Mutex<Connection>,
 }
 
+/// キャッシュ横断検索の条件 (notedeck#945)。`Default` は「絞り込みなし」。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CachedSearchOptions<'a> {
+    /// 本文の検索語。3 文字以上は FTS (trigram)、それ未満は LIKE、空なら全件
+    pub query: &'a str,
+    pub limit: i64,
+    /// created_at の下限 / 上限 (ISO 8601、両端含む)
+    pub since_date: Option<&'a str>,
+    pub until_date: Option<&'a str>,
+    /// true なら古い順
+    pub ascending: bool,
+    /// 投稿者 `name` または `name@host` (大文字小文字を区別しない)
+    pub author: Option<&'a str>,
+    /// Some(true) = 添付あり、Some(false) = 添付なし
+    pub has_files: Option<bool>,
+}
+
 impl Database {
     /// デフォルトの eviction policy で DB を開く。 後方互換性のために維持。
     pub fn open(path: &Path) -> Result<Self, NoteDeckError> {
@@ -829,11 +846,14 @@ impl Database {
     ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
         self.search_cached_notes_across(
             &[account_id],
-            query,
-            limit,
-            since_date,
-            until_date,
-            ascending,
+            &CachedSearchOptions {
+                query,
+                limit,
+                since_date,
+                until_date,
+                ascending,
+                ..Default::default()
+            },
         )
     }
 
@@ -843,15 +863,20 @@ impl Database {
     pub fn search_cached_notes_across(
         &self,
         account_ids: &[&str],
-        query: &str,
-        limit: i64,
-        since_date: Option<&str>,
-        until_date: Option<&str>,
-        ascending: bool,
+        opts: &CachedSearchOptions<'_>,
     ) -> Result<Vec<NormalizedNote>, NoteDeckError> {
         if account_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let CachedSearchOptions {
+            query,
+            limit,
+            since_date,
+            until_date,
+            ascending,
+            author,
+            has_files,
+        } = *opts;
         let conn = self.lock_read()?;
         let order = if ascending { "ASC" } else { "DESC" };
         let has_query = !query.is_empty();
@@ -895,6 +920,36 @@ impl Database {
             param_idx += 1;
         }
 
+        // 投稿者: `name` または `name@host`。host 省略時は取得元サーバーを問わず
+        // username だけで一致させる。ローカルユーザーは user.host が null なので、
+        // host 指定時は取得元 (server_host) で補う
+        let author_parts = author.map(|a| {
+            let a = a.trim().trim_start_matches('@');
+            match a.split_once('@') {
+                Some((name, host)) => (name.to_lowercase(), Some(host.to_lowercase())),
+                None => (a.to_lowercase(), None),
+            }
+        });
+        if let Some((_, host)) = &author_parts {
+            conditions.push(format!(
+                "LOWER(json_extract(nc.note_json, '$.user.username')) = ?{param_idx}"
+            ));
+            param_idx += 1;
+            if host.is_some() {
+                conditions.push(format!(
+                    "LOWER(COALESCE(json_extract(nc.note_json, '$.user.host'), nc.server_host)) = ?{param_idx}"
+                ));
+                param_idx += 1;
+            }
+        }
+        if let Some(with_files) = has_files {
+            conditions.push(if with_files {
+                "json_array_length(nc.note_json, '$.files') > 0".to_string()
+            } else {
+                "json_array_length(nc.note_json, '$.files') = 0".to_string()
+            });
+        }
+
         let sql = format!(
             "SELECT nc.note_json FROM notes_cache nc WHERE {} ORDER BY nc.created_at {order} LIMIT ?{param_idx}",
             conditions.join(" AND "),
@@ -917,6 +972,12 @@ impl Database {
         }
         if let Some(d) = until_date {
             dynamic_params.push(Box::new(d.to_string()));
+        }
+        if let Some((name, host)) = author_parts {
+            dynamic_params.push(Box::new(name));
+            if let Some(host) = host {
+                dynamic_params.push(Box::new(host));
+            }
         }
         dynamic_params.push(Box::new(limit));
 
@@ -4020,6 +4081,97 @@ mod tests {
     }
 
     #[test]
+    fn search_cached_notes_across_filters_by_author_and_files() {
+        let (_dir, db) = temp_db();
+        let mut by_alice_local = variant("n1", "acc-1", "a.example", None);
+        by_alice_local.user.username = "Alice".to_string();
+        by_alice_local.user.host = None;
+        let mut by_alice_remote = variant("n2", "acc-2", "b.example", None);
+        by_alice_remote.user.username = "alice".to_string();
+        by_alice_remote.user.host = Some("a.example".to_string());
+        by_alice_remote
+            .files
+            .push(crate::models::NormalizedDriveFile {
+                id: "f1".to_string(),
+                name: "img.png".to_string(),
+                file_type: "image/png".to_string(),
+                url: "https://b.example/f1".to_string(),
+                thumbnail_url: None,
+                size: 1,
+                is_sensitive: false,
+                width: None,
+                height: None,
+                blurhash: None,
+            });
+        let mut by_bob = variant("n3", "acc-1", "a.example", None);
+        by_bob.user.username = "bob".to_string();
+        db.ingest_notes(&[by_alice_local, by_alice_remote, by_bob], &tk("home"))
+            .unwrap();
+        let accounts = ["acc-1", "acc-2"];
+        let base = CachedSearchOptions {
+            limit: 10,
+            ..Default::default()
+        };
+
+        // username だけ: 取得元を問わず、大文字小文字も区別しない
+        let alice = db
+            .search_cached_notes_across(
+                &accounts,
+                &CachedSearchOptions {
+                    author: Some("@alice"),
+                    ..base
+                },
+            )
+            .unwrap();
+        assert_eq!(alice.len(), 2);
+
+        // name@host: ローカルユーザー (host null) は取得元サーバーで補う
+        let alice_at_a = db
+            .search_cached_notes_across(
+                &accounts,
+                &CachedSearchOptions {
+                    author: Some("alice@A.example"),
+                    ..base
+                },
+            )
+            .unwrap();
+        assert_eq!(alice_at_a.len(), 2);
+        let alice_at_b = db
+            .search_cached_notes_across(
+                &accounts,
+                &CachedSearchOptions {
+                    author: Some("alice@b.example"),
+                    ..base
+                },
+            )
+            .unwrap();
+        assert!(alice_at_b.is_empty());
+
+        // 添付の有無
+        let with_files = db
+            .search_cached_notes_across(
+                &accounts,
+                &CachedSearchOptions {
+                    has_files: Some(true),
+                    ..base
+                },
+            )
+            .unwrap();
+        assert_eq!(with_files.len(), 1);
+        assert_eq!(with_files[0].id, "n2");
+        let without_files = db
+            .search_cached_notes_across(
+                &accounts,
+                &CachedSearchOptions {
+                    has_files: Some(false),
+                    ..base
+                },
+            )
+            .unwrap();
+        assert_eq!(without_files.len(), 2);
+    }
+
+    #[test]
     fn search_cached_notes_across_returns_variants_of_all_accounts() {
         let (_dir, db) = temp_db();
         let a = variant(
@@ -4038,14 +4190,28 @@ mod tests {
         db.ingest_notes(&[a, b, other], &tk("home")).unwrap();
 
         let hits = db
-            .search_cached_notes_across(&["acc-1", "acc-2"], "identity", 10, None, None, false)
+            .search_cached_notes_across(
+                &["acc-1", "acc-2"],
+                &CachedSearchOptions {
+                    query: "identity",
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits
             .iter()
             .all(|n| n.identity == "https://o.example/notes/z"));
         assert!(db
-            .search_cached_notes_across(&[], "identity", 10, None, None, false)
+            .search_cached_notes_across(
+                &[],
+                &CachedSearchOptions {
+                    query: "identity",
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .unwrap()
             .is_empty());
         // 単一アカウント版は横断版の薄いラッパ
