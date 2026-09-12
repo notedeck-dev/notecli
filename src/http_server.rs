@@ -322,6 +322,11 @@ pub fn endpoints_from_spec(openapi: &utoipa::openapi::OpenApi) -> Vec<Value> {
 
 // --- Auth middleware ---
 
+// axum の middleware は「通す (Next の応答) / 弾く (エラー応答)」を
+// Result<Response, Response> で短絡させるのが定型で、Err 側の Response を
+// Box にすると from_fn の型に乗らない。新しい clippy (result_large_err) が
+// Err の大きさだけを見て警告するので、この関数に限って許可する
+#[allow(clippy::result_large_err)]
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request,
